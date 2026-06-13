@@ -1,0 +1,5 @@
+{
+  "type": "module",
+  "private": true,
+  "//": "This file exists so that dispatch-watch.js can use ES module syntax (import/export) even when the skill is copied into a project whose own package.json does not declare type: module. Do not add dependencies here — dispatch-watch.js only uses Node stdlib."
+}

@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>dispatch — 登入</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=DM+Sans:wght@400;500;600;700&display=swap');
+
+  :root {
+    --bg: #0a0a0c;
+    --surface: #131318;
+    --surface2: #1a1a22;
+    --border: #25252f;
+    --border-accent: #33334a;
+    --text: #e8e8ed;
+    --text-dim: #7a7a8a;
+    --text-muted: #4a4a58;
+    --accent: #6e56ff;
+    --accent-glow: rgba(110, 86, 255, 0.15);
+    --red: #f87171;
+    --red-dim: rgba(248, 113, 113, 0.12);
+    --radius: 8px;
+    --mono: 'JetBrains Mono', 'PingFang TC', 'Microsoft JhengHei', 'Heiti TC', monospace;
+    --sans: 'DM Sans', 'PingFang TC', 'Microsoft JhengHei', 'Heiti TC', sans-serif;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+  }
+
+  .noise {
+    position: fixed; inset: 0; z-index: 0; pointer-events: none; opacity: 0.03;
+    background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+    background-size: 200px;
+  }
+
+  .card {
+    position: relative; z-index: 1;
+    width: 100%; max-width: 440px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 36px 32px;
+  }
+
+  .logo {
+    display: flex; align-items: center; gap: 12px; margin-bottom: 28px;
+  }
+
+  .logo-icon {
+    width: 36px; height: 36px; border-radius: 10px;
+    background: linear-gradient(135deg, var(--accent), #9b7dff);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 18px; font-weight: 700; color: white;
+    box-shadow: 0 0 24px var(--accent-glow);
+  }
+
+  .logo h1 {
+    font-family: var(--mono); font-size: 20px; font-weight: 600;
+    letter-spacing: -0.5px;
+  }
+
+  .logo h1 span { color: var(--text-dim); font-weight: 300; }
+
+  h2 {
+    font-size: 18px; font-weight: 600; margin-bottom: 8px;
+  }
+
+  p.hint {
+    color: var(--text-dim); font-size: 13px; line-height: 1.6;
+    margin-bottom: 24px;
+  }
+
+  label {
+    display: block;
+    font-family: var(--mono); font-size: 11px;
+    text-transform: uppercase; letter-spacing: 1.2px;
+    color: var(--text-muted); margin-bottom: 8px;
+  }
+
+  input {
+    width: 100%;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text);
+    font-family: var(--mono); font-size: 13px;
+    padding: 12px 14px;
+    outline: none;
+    transition: border-color 0.15s;
+  }
+
+  input:focus { border-color: var(--accent); }
+
+  .field { margin-bottom: 14px; }
+  .field:last-of-type { margin-bottom: 0; }
+
+  button {
+    width: 100%;
+    margin-top: 20px;
+    background: var(--accent);
+    color: white;
+    border: none;
+    border-radius: var(--radius);
+    font-family: var(--sans); font-size: 14px; font-weight: 600;
+    padding: 12px 16px;
+    cursor: pointer;
+    transition: background 0.15s, transform 0.05s;
+  }
+
+  button:hover { background: #7e68ff; }
+  button:active { transform: scale(0.99); }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  .error {
+    margin-top: 16px;
+    padding: 10px 14px;
+    border-radius: var(--radius);
+    background: var(--red-dim);
+    border: 1px solid rgba(248, 113, 113, 0.3);
+    color: var(--red);
+    font-family: var(--mono); font-size: 12px;
+    display: none;
+  }
+  .error.visible { display: block; }
+
+  .footnote {
+    margin-top: 24px;
+    color: var(--text-muted);
+    font-family: var(--mono); font-size: 11px;
+    line-height: 1.6;
+  }
+</style>
+</head>
+<body>
+<div class="noise"></div>
+<div class="card">
+  <div class="logo">
+    <div class="logo-icon">D</div>
+    <h1>dispatch <span>/ 登入</span></h1>
+  </div>
+  <h2>登入儀表板</h2>
+  <p class="hint">
+    請使用管理員透過
+    <code style="color:var(--text);">node&nbsp;src/admin.js&nbsp;set-password&nbsp;&lt;帳號&gt;</code>
+    所設定的帳號與密碼。
+  </p>
+  <form id="form">
+    <div class="field">
+      <label for="handle">帳號</label>
+      <input id="handle" type="text" placeholder="alex" required autofocus autocomplete="username">
+    </div>
+    <div class="field">
+      <label for="password">密碼</label>
+      <input id="password" type="password" required autocomplete="current-password">
+    </div>
+    <button id="submit" type="submit">登入</button>
+    <div id="error" class="error"></div>
+  </form>
+  <div class="footnote">
+    儀表板密碼與 <code style="color:var(--text);">.claude/claude.json</code> 內的 bearer token 是獨立的。
+  </div>
+</div>
+
+<script>
+const form = document.getElementById('form');
+const handleInput = document.getElementById('handle');
+const passwordInput = document.getElementById('password');
+const submit = document.getElementById('submit');
+const errorBox = document.getElementById('error');
+
+form.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  errorBox.classList.remove('visible');
+  submit.disabled = true;
+  submit.textContent = '登入中…';
+  try {
+    const res = await fetch('/api/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        handle: handleInput.value.trim(),
+        password: passwordInput.value,
+      }),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.error || `HTTP ${res.status}`);
+    }
+    window.location.href = '/';
+  } catch (err) {
+    errorBox.textContent = err.message || '登入失敗';
+    errorBox.classList.add('visible');
+    submit.disabled = false;
+    submit.textContent = '登入';
+    passwordInput.value = '';
+    passwordInput.focus();
+  }
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,791 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>dispatch — 任務面板</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=DM+Sans:wght@400;500;600;700&display=swap');
+
+  :root {
+    --bg: #0a0a0c;
+    --surface: #131318;
+    --surface2: #1a1a22;
+    --border: #25252f;
+    --border-accent: #33334a;
+    --text: #e8e8ed;
+    --text-dim: #7a7a8a;
+    --text-muted: #4a4a58;
+    --accent: #6e56ff;
+    --accent-glow: rgba(110, 86, 255, 0.15);
+    --green: #34d399;
+    --green-dim: rgba(52, 211, 153, 0.12);
+    --amber: #fbbf24;
+    --amber-dim: rgba(251, 191, 36, 0.12);
+    --red: #f87171;
+    --red-dim: rgba(248, 113, 113, 0.12);
+    --blue: #60a5fa;
+    --blue-dim: rgba(96, 165, 250, 0.12);
+    --radius: 8px;
+    --mono: 'JetBrains Mono', 'PingFang TC', 'Microsoft JhengHei', 'Heiti TC', monospace;
+    --sans: 'DM Sans', 'PingFang TC', 'Microsoft JhengHei', 'Heiti TC', sans-serif;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    min-height: 100vh;
+    overflow-x: hidden;
+  }
+
+  .noise {
+    position: fixed; inset: 0; z-index: 0; pointer-events: none; opacity: 0.03;
+    background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+    background-size: 200px;
+  }
+
+  .container {
+    position: relative; z-index: 1;
+    max-width: 1100px; margin: 0 auto; padding: 40px 24px;
+  }
+
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 40px; padding-bottom: 24px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .logo {
+    display: flex; align-items: center; gap: 12px;
+  }
+
+  .logo-icon {
+    width: 36px; height: 36px; border-radius: 10px;
+    background: linear-gradient(135deg, var(--accent), #9b7dff);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 18px; font-weight: 700; color: white;
+    box-shadow: 0 0 24px var(--accent-glow);
+  }
+
+  .logo h1 {
+    font-family: var(--mono); font-size: 20px; font-weight: 600;
+    letter-spacing: -0.5px;
+  }
+
+  .logo h1 span { color: var(--text-dim); font-weight: 300; }
+
+  .presence-bar {
+    display: flex; gap: 16px; align-items: center;
+  }
+
+  .presence-dot {
+    display: flex; align-items: center; gap: 8px;
+    padding: 6px 14px; border-radius: 20px;
+    background: var(--surface); border: 1px solid var(--border);
+    font-size: 13px; font-family: var(--mono);
+  }
+
+  .presence-dot .dot {
+    width: 8px; height: 8px; border-radius: 50%; background: var(--green);
+    box-shadow: 0 0 8px var(--green);
+    animation: pulse 2s infinite;
+  }
+
+  .presence-dot.offline .dot {
+    background: var(--text-muted); box-shadow: none; animation: none;
+  }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.4; }
+  }
+
+  .stats-row {
+    display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px;
+    margin-bottom: 32px;
+  }
+
+  .stat-card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 16px 20px;
+  }
+
+  .stat-card .label {
+    font-size: 11px; text-transform: uppercase; letter-spacing: 1.2px;
+    color: var(--text-muted); margin-bottom: 6px; font-family: var(--mono);
+  }
+
+  .stat-card .value {
+    font-size: 28px; font-weight: 700; font-family: var(--mono);
+  }
+
+  .stat-card.open .value { color: var(--blue); }
+  .stat-card.progress .value { color: var(--amber); }
+  .stat-card.done .value { color: var(--green); }
+  .stat-card.total .value { color: var(--text); }
+
+  .section-title {
+    font-family: var(--mono); font-size: 13px; font-weight: 500;
+    text-transform: uppercase; letter-spacing: 1.5px;
+    color: var(--text-muted); margin-bottom: 16px;
+    display: flex; align-items: center; gap: 10px;
+  }
+
+  .section-title::after {
+    content: ''; flex: 1; height: 1px; background: var(--border);
+  }
+
+  .task-list { display: flex; flex-direction: column; gap: 8px; margin-bottom: 40px; }
+
+  .task-card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 16px 20px;
+    display: grid; grid-template-columns: auto 1fr auto;
+    gap: 16px; align-items: start;
+    transition: border-color 0.15s, background 0.15s;
+  }
+
+  .task-card:hover {
+    border-color: var(--border-accent); background: var(--surface2);
+  }
+
+  .task-status {
+    width: 10px; height: 10px; border-radius: 50%; margin-top: 6px;
+    flex-shrink: 0;
+  }
+
+  .task-status.open { background: var(--blue); box-shadow: 0 0 8px var(--blue-dim); }
+  .task-status.in_progress { background: var(--amber); box-shadow: 0 0 8px var(--amber-dim); }
+  .task-status.pushed { background: #a78bfa; box-shadow: 0 0 8px rgba(167, 139, 250, 0.3); }
+  .task-status.closed,
+  .task-status.done { background: var(--green); box-shadow: 0 0 8px var(--green-dim); }
+  .task-status.cancelled { background: var(--text-muted); }
+
+  .task-body { min-width: 0; }
+
+  .task-title {
+    font-weight: 600; font-size: 15px; margin-bottom: 4px;
+    display: flex; align-items: center; gap: 10px;
+  }
+
+  .task-title .task-id {
+    font-family: var(--mono); font-size: 11px; color: var(--text-muted);
+    background: var(--surface2); padding: 2px 7px; border-radius: 4px;
+    font-weight: 400;
+  }
+
+  .task-desc {
+    color: var(--text-dim); font-size: 13px; line-height: 1.5;
+    margin-bottom: 8px;
+    overflow: hidden; text-overflow: ellipsis;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+  }
+
+  .task-meta {
+    display: flex; gap: 12px; align-items: center; flex-wrap: wrap;
+  }
+
+  .tag {
+    font-family: var(--mono); font-size: 11px; padding: 3px 8px;
+    border-radius: 4px; font-weight: 500;
+  }
+
+  .tag.type { background: var(--accent-glow); color: var(--accent); }
+  .tag.kind-review { background: var(--blue-dim); color: var(--blue); }
+  .tag.kind-work { background: rgba(167, 139, 250, 0.15); color: #a78bfa; }
+  .tag.kind-discussion { background: var(--surface2); color: var(--text-dim); }
+  .tag.verdict-approved { background: var(--green-dim); color: var(--green); }
+  .tag.verdict-changes_requested { background: var(--red-dim); color: var(--red); }
+  .tag.priority-urgent { background: var(--red-dim); color: var(--red); }
+  .tag.priority-high { background: var(--amber-dim); color: var(--amber); }
+  .tag.priority-normal { background: var(--surface2); color: var(--text-dim); }
+  .tag.priority-low { background: var(--surface2); color: var(--text-muted); }
+
+  .tag.user-from { color: var(--text-dim); }
+  .tag.user-to { color: var(--green); }
+
+  .git-info {
+    margin-top: 8px;
+    padding: 6px 10px;
+    background: var(--surface2);
+    border-radius: 4px;
+    font-family: var(--mono); font-size: 11px;
+    color: var(--text-dim);
+    line-height: 1.5;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .git-info .git-label {
+    color: var(--text-muted);
+  }
+  .git-info .git-sha {
+    color: var(--accent);
+  }
+  .git-info .git-arrow {
+    margin: 0 6px;
+    color: var(--text-muted);
+  }
+
+  .task-right {
+    font-family: var(--mono); font-size: 11px; color: var(--text-muted);
+    white-space: nowrap; text-align: right; padding-top: 4px;
+  }
+
+  .files-list {
+    display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px;
+  }
+
+  .file-tag {
+    font-family: var(--mono); font-size: 10px; color: var(--text-dim);
+    background: var(--surface2); padding: 2px 6px; border-radius: 3px;
+  }
+
+  .empty-state {
+    text-align: center; padding: 60px 20px; color: var(--text-muted);
+    font-family: var(--mono); font-size: 14px;
+  }
+
+  .result-bar {
+    margin-top: 8px; padding: 8px 12px; border-radius: 4px;
+    background: var(--green-dim); border: 1px solid rgba(52, 211, 153, 0.2);
+    font-size: 12px; color: var(--green); font-family: var(--mono);
+  }
+
+  .refresh-note {
+    text-align: center; color: var(--text-muted); font-size: 12px;
+    font-family: var(--mono); margin-top: 24px;
+  }
+
+  /* ── Completions drawer (Option E) ─────────────────────────────
+     Unacknowledged outbound completions — tasks the signed-in user
+     dispatched that have reached a terminal state since they last
+     clicked "acknowledge". */
+  .completions-drawer {
+    margin: 20px 0;
+    padding: 16px 20px;
+    border-radius: 10px;
+    background: var(--green-dim);
+    border: 1px solid rgba(52, 211, 153, 0.3);
+    display: none;
+  }
+  .completions-drawer.visible { display: block; }
+  .completions-drawer .head {
+    display: flex; justify-content: space-between; align-items: center;
+    margin-bottom: 12px; font-size: 13px; color: var(--green);
+    font-family: var(--mono);
+  }
+  .completions-drawer .head strong {
+    font-weight: 600; letter-spacing: 0.3px;
+  }
+  .completions-drawer .ack-btn {
+    background: transparent;
+    border: 1px solid rgba(52, 211, 153, 0.4);
+    color: var(--green);
+    padding: 4px 10px; border-radius: 4px;
+    font-family: var(--mono); font-size: 11px;
+    cursor: pointer;
+  }
+  .completions-drawer .ack-btn:hover {
+    background: rgba(52, 211, 153, 0.15);
+  }
+  .completions-drawer .item {
+    padding: 8px 0; border-top: 1px solid rgba(52, 211, 153, 0.15);
+    font-family: var(--mono); font-size: 12px;
+  }
+  .completions-drawer .item:first-of-type { border-top: none; }
+  .completions-drawer .item .row {
+    display: flex; gap: 10px; align-items: center;
+  }
+  .completions-drawer .item .id {
+    color: var(--text-dim); min-width: 7ch;
+  }
+  .completions-drawer .item .outcome {
+    color: var(--green); font-weight: 600;
+  }
+  .completions-drawer .item .outcome.cancelled { color: var(--red); }
+  .completions-drawer .item .title {
+    color: var(--text); flex: 1; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap;
+  }
+  .completions-drawer .item .by {
+    color: var(--text-muted); font-size: 11px;
+  }
+  .completions-drawer .item .result {
+    margin-top: 4px; padding-left: 8ch;
+    color: var(--text-dim); font-size: 11px;
+    white-space: pre-wrap; word-break: break-word;
+  }
+
+  .session-bar {
+    margin-top: 8px; text-align: center;
+    font-family: var(--mono); font-size: 11px; color: var(--text-muted);
+  }
+  .session-bar a {
+    color: var(--text-dim); text-decoration: none;
+    border-bottom: 1px dashed var(--text-muted); cursor: pointer;
+  }
+  .session-bar a:hover { color: var(--text); }
+
+  /* ── Change-password modal ──────────────────────────────────── */
+  .modal-overlay {
+    position: fixed; inset: 0; z-index: 100;
+    background: rgba(0, 0, 0, 0.6);
+    backdrop-filter: blur(4px);
+    display: none;
+    align-items: center; justify-content: center;
+    padding: 24px;
+  }
+  .modal-overlay.visible { display: flex; }
+
+  .modal {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 28px 28px 24px;
+    width: 100%; max-width: 380px;
+  }
+  .modal h2 {
+    font-size: 16px; font-weight: 600; margin-bottom: 6px;
+  }
+  .modal p.hint {
+    color: var(--text-dim); font-size: 12px; line-height: 1.5;
+    margin-bottom: 18px;
+  }
+  .modal .field { margin-bottom: 12px; }
+  .modal label {
+    display: block;
+    font-family: var(--mono); font-size: 10px;
+    text-transform: uppercase; letter-spacing: 1.2px;
+    color: var(--text-muted); margin-bottom: 6px;
+  }
+  .modal input {
+    width: 100%;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text);
+    font-family: var(--mono); font-size: 13px;
+    padding: 10px 12px;
+    outline: none;
+    transition: border-color 0.15s;
+  }
+  .modal input:focus { border-color: var(--accent); }
+  .modal-actions {
+    display: flex; gap: 8px; margin-top: 18px;
+  }
+  .modal-actions button {
+    flex: 1;
+    border: none; border-radius: var(--radius);
+    font-family: var(--sans); font-size: 13px; font-weight: 600;
+    padding: 10px 14px;
+    cursor: pointer;
+    transition: background 0.15s, transform 0.05s;
+  }
+  .modal-actions button[type="button"] {
+    background: var(--surface2);
+    color: var(--text-dim);
+  }
+  .modal-actions button[type="button"]:hover { color: var(--text); }
+  .modal-actions button[type="submit"] {
+    background: var(--accent);
+    color: white;
+  }
+  .modal-actions button[type="submit"]:hover { background: #7e68ff; }
+  .modal-actions button:active { transform: scale(0.99); }
+  .modal-actions button:disabled { opacity: 0.5; cursor: not-allowed; }
+  .modal-msg {
+    margin-top: 14px;
+    padding: 8px 12px;
+    border-radius: var(--radius);
+    font-family: var(--mono); font-size: 11px;
+    display: none;
+  }
+  .modal-msg.error {
+    display: block;
+    background: var(--red-dim);
+    border: 1px solid rgba(248, 113, 113, 0.3);
+    color: var(--red);
+  }
+  .modal-msg.success {
+    display: block;
+    background: var(--green-dim);
+    border: 1px solid rgba(52, 211, 153, 0.3);
+    color: var(--green);
+  }
+
+  @media (max-width: 700px) {
+    .stats-row { grid-template-columns: repeat(2, 1fr); }
+    .task-card { grid-template-columns: auto 1fr; }
+    .task-right { grid-column: 2; }
+  }
+</style>
+</head>
+<body>
+<div class="noise"></div>
+<div class="container">
+  <header>
+    <div class="logo">
+      <div class="logo-icon">D</div>
+      <h1>dispatch <span>/ 任務面板</span></h1>
+    </div>
+    <div class="presence-bar" id="presence"></div>
+  </header>
+
+  <div class="stats-row" id="stats">
+    <div class="stat-card open"><div class="label">待處理</div><div class="value" id="stat-open">—</div></div>
+    <div class="stat-card progress"><div class="label">進行中</div><div class="value" id="stat-progress">—</div></div>
+    <div class="stat-card done"><div class="label">已完成</div><div class="value" id="stat-done">—</div></div>
+    <div class="stat-card total"><div class="label">總計</div><div class="value" id="stat-total">—</div></div>
+  </div>
+
+  <div class="completions-drawer" id="completions-drawer">
+    <div class="head">
+      <strong id="completions-head">✅ 尚未確認的完成項目</strong>
+      <button class="ack-btn" id="ack-completions">全部標記為已讀</button>
+    </div>
+    <div id="completions-list"></div>
+  </div>
+
+  <div class="section-title">進行中的任務</div>
+  <div class="task-list" id="active-tasks"></div>
+
+  <div class="section-title">已完成 / 已取消</div>
+  <div class="task-list" id="done-tasks"></div>
+
+  <div class="refresh-note">每 5 秒自動更新</div>
+  <div class="session-bar">
+    <span id="session-handle">—</span> · <a id="change-pw">變更密碼</a> · <a id="logout">登出</a>
+  </div>
+</div>
+
+<div class="modal-overlay" id="modal-overlay">
+  <div class="modal">
+    <h2>變更密碼</h2>
+    <p class="hint">請輸入目前的密碼並設定新密碼（至少 8 個字元）。</p>
+    <form id="change-pw-form" autocomplete="off">
+      <div class="field">
+        <label for="cur-pw">目前密碼</label>
+        <input id="cur-pw" type="password" required autocomplete="current-password">
+      </div>
+      <div class="field">
+        <label for="new-pw">新密碼</label>
+        <input id="new-pw" type="password" required minlength="8" autocomplete="new-password">
+      </div>
+      <div class="field">
+        <label for="new-pw2">確認新密碼</label>
+        <input id="new-pw2" type="password" required minlength="8" autocomplete="new-password">
+      </div>
+      <div class="modal-actions">
+        <button type="button" id="cancel-pw">取消</button>
+        <button type="submit" id="save-pw">儲存</button>
+      </div>
+      <div id="pw-msg" class="modal-msg"></div>
+    </form>
+  </div>
+</div>
+
+<script>
+const API = window.location.origin + '/api';
+
+function timeAgo(dateStr) {
+  const now = new Date();
+  const d = new Date(dateStr + 'Z');
+  const s = Math.floor((now - d) / 1000);
+  if (s < 60) return '剛剛';
+  if (s < 3600) return Math.floor(s / 60) + ' 分鐘前';
+  if (s < 86400) return Math.floor(s / 3600) + ' 小時前';
+  return Math.floor(s / 86400) + ' 天前';
+}
+
+const KIND_LABELS = { review: '審查', work: '開發', discussion: '討論' };
+const VERDICT_LABELS = { approved: '通過', changes_requested: '需修改' };
+
+function shortSha(sha) {
+  return sha ? sha.slice(0, 7) : '';
+}
+
+function escapeHtml(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+// Build the git-info line for review/work tasks. Format depends on what's
+// pinned: base→head when both are set, otherwise whichever is available.
+function renderGitInfo(t) {
+  if (t.kind !== 'review' && t.kind !== 'work') return '';
+  if (!t.repo && !t.head_commit && !t.base_commit) return '';
+
+  const parts = [];
+  if (t.repo) parts.push(`<span class="git-label">repo:</span> ${escapeHtml(t.repo)}`);
+
+  const hasBase = t.base_commit && t.base_branch;
+  const hasHead = t.head_commit && t.head_branch;
+
+  if (hasBase && hasHead) {
+    parts.push(
+      `<span>${escapeHtml(t.base_branch)} @ <span class="git-sha">${shortSha(t.base_commit)}</span></span>` +
+      `<span class="git-arrow">→</span>` +
+      `<span>${escapeHtml(t.head_branch)} @ <span class="git-sha">${shortSha(t.head_commit)}</span></span>`
+    );
+  } else if (hasHead) {
+    parts.push(
+      `<span>${escapeHtml(t.head_branch)} @ <span class="git-sha">${shortSha(t.head_commit)}</span></span>`
+    );
+  } else if (hasBase) {
+    parts.push(
+      `<span class="git-label">自:</span> ${escapeHtml(t.base_branch)} @ <span class="git-sha">${shortSha(t.base_commit)}</span>`
+    );
+  } else if (t.head_branch) {
+    parts.push(`<span class="git-label">分支:</span> ${escapeHtml(t.head_branch)}`);
+  }
+
+  return `<div class="git-info">${parts.join(' · ')}</div>`;
+}
+
+function renderTask(t) {
+  const files = t.files && t.files.length
+    ? `<div class="files-list">${t.files.map(f => `<span class="file-tag">${escapeHtml(f)}</span>`).join('')}</div>`
+    : '';
+  const result = t.result
+    ? `<div class="result-bar">✓ ${escapeHtml(t.result)}</div>`
+    : '';
+  const kindLabel = KIND_LABELS[t.kind] || t.kind || '討論';
+  const verdictTag = t.verdict
+    ? `<span class="tag verdict-${t.verdict}">${VERDICT_LABELS[t.verdict] || t.verdict}</span>`
+    : '';
+  return `
+    <div class="task-card">
+      <div class="task-status ${t.status}"></div>
+      <div class="task-body">
+        <div class="task-title">
+          ${escapeHtml(t.title)}
+          <span class="task-id">#${t.id}</span>
+        </div>
+        ${t.description ? `<div class="task-desc">${escapeHtml(t.description)}</div>` : ''}
+        <div class="task-meta">
+          <span class="tag kind-${t.kind || 'discussion'}">${kindLabel}</span>
+          <span class="tag priority-${t.priority}">${t.priority}</span>
+          ${verdictTag}
+          <span class="tag user-from">來自：${escapeHtml(t.from_user)}</span>
+          ${t.to_user ? `<span class="tag user-to">→ ${escapeHtml(t.to_user)}</span>` : ''}
+          ${t.claimed_by ? `<span class="tag user-to">認領：${escapeHtml(t.claimed_by)}</span>` : ''}
+        </div>
+        ${renderGitInfo(t)}
+        ${files}
+        ${result}
+      </div>
+      <div class="task-right">${timeAgo(t.created_at)}</div>
+    </div>
+  `;
+}
+
+function renderPresence(users) {
+  const el = document.getElementById('presence');
+  if (!users.length) {
+    el.innerHTML = '<div class="presence-dot offline"><span class="dot"></span> 目前無人上線</div>';
+    return;
+  }
+  const tenMinAgo = new Date(Date.now() - 10 * 60 * 1000);
+  el.innerHTML = users.map(u => {
+    const online = new Date(u.last_seen + 'Z') > tenMinAgo;
+    const label = u.working_on ? `${u.user}: ${u.working_on}` : u.user;
+    return `<div class="presence-dot ${online ? '' : 'offline'}"><span class="dot"></span> ${label}</div>`;
+  }).join('');
+}
+
+function renderCompletions(list) {
+  const drawer = document.getElementById('completions-drawer');
+  const head = document.getElementById('completions-head');
+  const container = document.getElementById('completions-list');
+  if (!list.length) {
+    drawer.classList.remove('visible');
+    container.innerHTML = '';
+    return;
+  }
+  head.textContent = `✅ 尚未確認的完成項目（${list.length}）`;
+  drawer.classList.add('visible');
+  container.innerHTML = list.map(c => {
+    const outcomeRaw =
+      c.status === 'cancelled' ? '已取消'
+      : c.kind === 'review' && c.verdict === 'approved' ? '已通過'
+      : c.kind === 'review' && c.verdict === 'changes_requested' ? '需修改'
+      : c.kind === 'work' && c.head_commit ? `已推送 ${c.head_branch || ''}@${c.head_commit.slice(0, 8)}`
+      : '已關閉';
+    const outcomeClass = c.status === 'cancelled' ? 'outcome cancelled' : 'outcome';
+    const resultHtml = c.result
+      ? `<div class="result">${escapeHtml(c.result)}</div>`
+      : '';
+    return `
+      <div class="item">
+        <div class="row">
+          <span class="id">#${escapeHtml(c.id)}</span>
+          <span class="${outcomeClass}">${escapeHtml(outcomeRaw)}</span>
+          <span class="title">${escapeHtml(c.title || '')}</span>
+          <span class="by">by ${escapeHtml(c.to_user || '?')}</span>
+        </div>
+        ${resultHtml}
+      </div>
+    `;
+  }).join('');
+}
+
+async function ackCompletions() {
+  try {
+    await fetch(API + '/recent-completions/ack', { method: 'POST' });
+    renderCompletions([]);
+  } catch (e) {
+    console.error('ack failed:', e);
+  }
+}
+
+async function refresh() {
+  try {
+    const [tasksRes, presenceRes, completionsRes] = await Promise.all([
+      fetch(API + '/tasks'),
+      fetch(API + '/presence'),
+      fetch(API + '/recent-completions'),
+    ]);
+    if (tasksRes.status === 401 || presenceRes.status === 401 || completionsRes.status === 401) {
+      window.location.href = '/login';
+      return;
+    }
+    const [tasks, presence, completions] = await Promise.all([
+      tasksRes.json(), presenceRes.json(), completionsRes.json(),
+    ]);
+
+    // New state machine: open → in_progress → pushed → closed|cancelled.
+    // 'done' is the legacy value for closed — kept for back-compat in case
+    // any row survived the migration.
+    const ACTIVE = new Set(['open', 'in_progress', 'pushed']);
+    const TERMINAL = new Set(['closed', 'cancelled', 'done']);
+    const active = tasks.filter(t => ACTIVE.has(t.status));
+    const done = tasks.filter(t => TERMINAL.has(t.status));
+
+    document.getElementById('stat-open').textContent = tasks.filter(t => t.status === 'open').length;
+    document.getElementById('stat-progress').textContent = tasks.filter(t => t.status === 'in_progress' || t.status === 'pushed').length;
+    document.getElementById('stat-done').textContent = tasks.filter(t => t.status === 'closed' || t.status === 'done').length;
+    document.getElementById('stat-total').textContent = tasks.length;
+
+    document.getElementById('active-tasks').innerHTML = active.length
+      ? active.map(renderTask).join('')
+      : '<div class="empty-state">目前沒有任務 — 全部清空</div>';
+    document.getElementById('done-tasks').innerHTML = done.length
+      ? done.map(renderTask).join('')
+      : '<div class="empty-state">尚未有已完成的任務</div>';
+
+    renderPresence(presence);
+    renderCompletions(completions);
+  } catch (e) {
+    console.error('refresh failed:', e);
+  }
+}
+
+async function loadSession() {
+  try {
+    const r = await fetch(API + '/whoami');
+    if (r.ok) {
+      const { handle } = await r.json();
+      document.getElementById('session-handle').textContent = '已登入：' + handle;
+    } else if (r.status === 401) {
+      window.location.href = '/login';
+    }
+  } catch (e) { /* ignore */ }
+}
+
+document.getElementById('logout').addEventListener('click', async () => {
+  await fetch(API + '/logout', { method: 'POST' });
+  window.location.href = '/login';
+});
+
+// ── Change password modal ─────────────────────────────────────────
+const overlay = document.getElementById('modal-overlay');
+const pwForm = document.getElementById('change-pw-form');
+const curPw = document.getElementById('cur-pw');
+const newPw = document.getElementById('new-pw');
+const newPw2 = document.getElementById('new-pw2');
+const savePw = document.getElementById('save-pw');
+const pwMsg = document.getElementById('pw-msg');
+
+function openPwModal() {
+  pwForm.reset();
+  pwMsg.className = 'modal-msg';
+  pwMsg.textContent = '';
+  savePw.disabled = false;
+  savePw.textContent = '儲存';
+  overlay.classList.add('visible');
+  setTimeout(() => curPw.focus(), 0);
+}
+
+function closePwModal() {
+  overlay.classList.remove('visible');
+}
+
+document.getElementById('change-pw').addEventListener('click', openPwModal);
+document.getElementById('cancel-pw').addEventListener('click', closePwModal);
+document.getElementById('ack-completions').addEventListener('click', ackCompletions);
+overlay.addEventListener('click', (e) => {
+  if (e.target === overlay) closePwModal();
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && overlay.classList.contains('visible')) closePwModal();
+});
+
+function showPwMsg(text, type) {
+  pwMsg.textContent = text;
+  pwMsg.className = 'modal-msg ' + type;
+}
+
+pwForm.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  pwMsg.className = 'modal-msg';
+  pwMsg.textContent = '';
+
+  if (newPw.value !== newPw2.value) {
+    showPwMsg('新密碼不一致', 'error');
+    newPw2.focus();
+    return;
+  }
+  if (newPw.value.length < 8) {
+    showPwMsg('新密碼至少需 8 個字元', 'error');
+    return;
+  }
+  if (newPw.value === curPw.value) {
+    showPwMsg('新密碼必須與目前密碼不同', 'error');
+    return;
+  }
+
+  savePw.disabled = true;
+  savePw.textContent = '儲存中…';
+  try {
+    const res = await fetch(API + '/change-password', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        current_password: curPw.value,
+        new_password: newPw.value,
+      }),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
+    showPwMsg('密碼已更新', 'success');
+    setTimeout(closePwModal, 1200);
+  } catch (err) {
+    showPwMsg(err.message || '無法變更密碼', 'error');
+    savePw.disabled = false;
+    savePw.textContent = '儲存';
+  }
+});
+
+loadSession();
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>

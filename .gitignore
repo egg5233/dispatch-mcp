@@ -1,0 +1,6 @@
+node_modules/
+data/
+logs
+*.log
+__pycache__/
+.pm2/

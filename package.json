@@ -1,0 +1,19 @@
+{
+  "name": "dispatch-mcp",
+  "version": "1.0.0",
+  "description": "MCP server for dispatching work between Claude Code instances",
+  "type": "module",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dashboard": "node src/dashboard.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "bcryptjs": "^3.0.3",
+    "better-sqlite3": "^11.8.1",
+    "express": "^4.21.0",
+    "jsonwebtoken": "^9.0.3",
+    "uuid": "^10.0.0"
+  }
+}

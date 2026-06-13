@@ -822,6 +822,50 @@ app.get("/events", (req, res) => {
   });
 });
 
+// ── Plain HTTP message API (for the shell CLI) ─────────────────────
+//
+// dispatch-send / dispatch-recv talk to these. Bearer-authed, identity
+// from the token. Same store + event bus as the MCP tools, so an
+// already-running agent (which can't pick up a new MCP server without a
+// restart) can still send and receive via a one-line curl. Uniform
+// across Claude Code and Codex.
+
+function httpIdentity(req, res) {
+  const token = extractToken(req);
+  const user = token ? getUserByToken(token) : null;
+  if (!user) {
+    res.status(401).json({ error: "Missing or invalid bearer token." });
+    return null;
+  }
+  touchUser(user.handle, req.ip);
+  return user.handle;
+}
+
+app.post("/msg/send", express.json(), (req, res) => {
+  const identity = httpIdentity(req, res);
+  if (!identity) return;
+  const { to, body, priority } = req.body || {};
+  if (!body || typeof body !== "string") {
+    res.status(400).json({ error: "body (string) is required" });
+    return;
+  }
+  const message = sendMessage({
+    from_user: identity,
+    to_user: to || null,
+    body,
+    priority: priority || "normal",
+  });
+  emitMessageEvent(message, identity);
+  res.json({ delivered: true, id: message.id, to: to || "(broadcast)" });
+});
+
+app.get("/msg/recv", (req, res) => {
+  const identity = httpIdentity(req, res);
+  if (!identity) return;
+  const messages = pullUnreadMessages(identity);
+  res.json({ handle: identity, count: messages.length, messages });
+});
+
 // ── Dashboard auth (JWT cookie) ────────────────────────────────────
 //
 // /api/login takes {handle, password}, verifies the bcrypt hash from

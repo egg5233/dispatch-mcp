@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Send a message.  Usage: dispatch-send <to|all> <body...>   [PRIORITY=high]
+set -euo pipefail
+source "$(dirname "$(readlink -f "$0")")/dispatch-common.sh"
+tok="$(_dispatch_token)"
+[ -z "$tok" ] && { echo "dispatch-send: no token (pane '${TMUX_PANE:-?}' not registered, \$DISPATCH_TOKEN unset)"; exit 1; }
+to="${1:-}"; shift || true
+body="$*"
+{ [ -z "$to" ] || [ -z "$body" ]; } && { echo "usage: dispatch-send <to|all> <body...>"; exit 2; }
+[ "$to" = "all" ] && to=""
+payload="$(python3 -c 'import json,os,sys;print(json.dumps({"to":(sys.argv[1] or None),"body":sys.argv[2],"priority":os.environ.get("PRIORITY","normal")}))' "$to" "$body")"
+curl -s --max-time 10 -H "Authorization: Bearer $tok" -H 'content-type: application/json' -d "$payload" "$DISPATCH_URL/msg/send" | python3 -c '
+import json,sys
+try: d=json.load(sys.stdin)
+except Exception as e: print("dispatch-send: bad server response:",e); sys.exit(1)
+print("sent -> "+str(d.get("to"))+"  (id "+str(d.get("id"))+")" if d.get("delivered") else "FAILED: "+str(d))
+'

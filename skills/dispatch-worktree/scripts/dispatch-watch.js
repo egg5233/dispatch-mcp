@@ -44,6 +44,7 @@ const DRY_RUN = process.env.DISPATCH_DRY_RUN === "1";
 // safe in the server meanwhile, so deferring loses nothing.
 const BUSY_MARKER = process.env.DISPATCH_BUSY_MARKER || "esc to interrupt";
 const IDLE_POLL_MS = parseInt(process.env.DISPATCH_IDLE_POLL_MS || "1500", 10);
+const TMUX_BIN = process.env.DISPATCH_TMUX || "tmux";
 
 function die(msg) {
   console.error(msg);
@@ -110,7 +111,7 @@ function checkIdle(cb) {
   // send-keys poke is suppressed). With no target at all there's nothing
   // to inspect, so treat as idle.
   if (!TMUX_TARGET) return cb(true);
-  execFile("tmux", ["capture-pane", "-p", "-t", TMUX_TARGET], (err, stdout) => {
+  execFile(TMUX_BIN, ["capture-pane", "-p", "-t", TMUX_TARGET], (err, stdout) => {
     if (err) {
       console.error(`[${ts()}] capture-pane failed: ${err.message}`);
       return cb(false);
@@ -125,13 +126,21 @@ function pokeTmux() {
     console.log(`[${ts()}] DRY RUN would send "${PROMPT}" to ${TMUX_TARGET || "<unset>"} — ${label}`);
     return;
   }
-  execFile("tmux", ["send-keys", "-t", TMUX_TARGET, PROMPT, "Enter"], (err) => {
+  // Type the text (literal) and the Enter as SEPARATE send-keys calls with
+  // a short gap — a combined "text Enter" races on TUI composers (the Enter
+  // can arrive before the paste is processed, leaving text unsubmitted).
+  execFile(TMUX_BIN, ["send-keys", "-t", TMUX_TARGET, "-l", PROMPT], (err) => {
     if (err) {
-      console.error(`[${ts()}] tmux send-keys failed: ${err.message}`);
+      console.error(`[${ts()}] tmux send-keys (text) failed: ${err.message}`);
       console.error("  Is tmux running? Is TMUX_TARGET correct? Is the pane still open?");
       return;
     }
-    console.log(`[${ts()}] fired "${PROMPT}" → ${TMUX_TARGET}  (${label})`);
+    setTimeout(() => {
+      execFile(TMUX_BIN, ["send-keys", "-t", TMUX_TARGET, "Enter"], (e2) => {
+        if (e2) console.error(`[${ts()}] tmux send-keys (Enter) failed: ${e2.message}`);
+        else console.log(`[${ts()}] fired "${PROMPT}" → ${TMUX_TARGET}  (${label})`);
+      });
+    }, 200);
   });
 }
 

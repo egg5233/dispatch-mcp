@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Drain my unread dispatch messages. Identity = my tmux pane (or $DISPATCH_TOKEN).
+set -euo pipefail
+source "$(dirname "$(readlink -f "$0")")/dispatch-common.sh"
+tok="$(_dispatch_token)"
+[ -z "$tok" ] && { echo "dispatch-recv: no token (pane '${TMUX_PANE:-?}' not registered, \$DISPATCH_TOKEN unset)"; exit 1; }
+curl -s --max-time 10 -H "Authorization: Bearer $tok" "$DISPATCH_URL/msg/recv" | python3 -c '
+import json,sys
+try: d=json.load(sys.stdin)
+except Exception as e: print("dispatch-recv: bad server response:",e); sys.exit(1)
+ms=d.get("messages",[])
+if not ms: print("No new messages."); sys.exit(0)
+print(str(len(ms))+" message(s):")
+for m in ms:
+    pri=" ["+m["priority"]+"]" if m.get("priority") not in (None,"normal") else ""
+    sc="" if m.get("to_user") else " (broadcast)"
+    print("  - from "+m["from_user"]+sc+pri+" @ "+str(m.get("created_at","")))
+    print("    "+m["body"])
+'

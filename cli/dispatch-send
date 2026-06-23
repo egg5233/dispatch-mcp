@@ -13,5 +13,8 @@ curl -s --max-time 10 -H "Authorization: Bearer $tok" -H 'content-type: applicat
 import json,sys
 try: d=json.load(sys.stdin)
 except Exception as e: print("dispatch-send: bad server response:",e); sys.exit(1)
-print("sent -> "+str(d.get("to"))+"  (id "+str(d.get("id"))+")" if d.get("delivered") else "FAILED: "+str(d))
+if d.get("delivered"):
+    print("sent -> "+str(d.get("to"))+"  (id "+str(d.get("id"))+")")
+else:
+    print("dispatch-send FAILED: "+str(d.get("error") or d)); sys.exit(1)
 '

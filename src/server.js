@@ -17,6 +17,7 @@ import {
   checkConflicts,
   getUserByToken,
   getUserByHandle,
+  listUsers,
   setUserPasswordHash,
   touchUser,
   getRepo,
@@ -622,6 +623,24 @@ function createMcpServer(identity) {
       priority: z.enum(["low", "normal", "high", "urgent"]).optional().describe("Priority hint."),
     },
     async ({ to, body, priority }) => {
+      if (to && to !== "all" && !getUserByHandle(to)) {
+        return {
+          isError: true,
+          content: [{
+            type: "text",
+            text: JSON.stringify(
+              {
+                delivered: false,
+                error: `unknown recipient handle '${to}' — message NOT delivered. Known handles: ${listUsers()
+                  .map((u) => u.handle)
+                  .join(", ")}`,
+              },
+              null,
+              2
+            ),
+          }],
+        };
+      }
       const message = sendMessage({
         from_user: identity,
         to_user: to || null,
@@ -847,6 +866,17 @@ app.post("/msg/send", express.json(), (req, res) => {
   const { to, body, priority } = req.body || {};
   if (!body || typeof body !== "string") {
     res.status(400).json({ error: "body (string) is required" });
+    return;
+  }
+  // Reject directed messages to unknown handles — otherwise the message is
+  // silently stored under a recipient nobody polls and is never delivered.
+  if (to && to !== "all" && !getUserByHandle(to)) {
+    res.status(404).json({
+      delivered: false,
+      error: `unknown recipient handle '${to}' — message NOT delivered. Known handles: ${listUsers()
+        .map((u) => u.handle)
+        .join(", ")}`,
+    });
     return;
   }
   const message = sendMessage({

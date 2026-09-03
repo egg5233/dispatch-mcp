@@ -1,10 +1,19 @@
 #!/usr/bin/env python3
 """Fleet registry + health check.
 
-usage: dispatch-fleet check            audit every handle (tmux pane, watcher, Claude session, server inbox)
-       dispatch-fleet sync [--write]   build fleet.json from registry.json + pm2 + ~/.claude/sessions
-                                       (--write also regenerates registry.json from fleet.json for old consumers)
-       dispatch-fleet show             print fleet.json
+usage: dispatch-fleet check [--json]        audit every handle (tmux pane, watcher, Claude session, server inbox)
+       dispatch-fleet sync [--write] [--prune]
+                                       refresh fleet.json from registry.json + pm2 + ~/.claude/sessions.
+                                       --prune drops handles whose pane is gone AND that have no pm2 watcher
+                                       (retired agents); --write also regenerates registry.json from fleet.json
+       dispatch-fleet remove <handle> [--watcher]
+                                       retire a handle: drop it from fleet.json AND registry.json so sync
+                                       cannot resurrect it; --watcher also `pm2 delete watch-<handle>`.
+                                       The server user and message history are untouched (admin.js remove).
+       dispatch-fleet watchers [--restart] [--only <handle>]
+                                       pm2 start (or restart) one watch-<handle> per fleet.json entry, env
+                                       derived from fleet.json — the replacement for watchers.<host>.cjs
+       dispatch-fleet show             print fleet.json (tokens redacted)
 
 fleet.json is the single source of truth: handle -> token / runtime / pane /
 session_name / cwd / watcher. registry.json (pane -> handle/token/runtime)
@@ -67,18 +76,21 @@ def tmux_panes():
     return res
 
 
-def build_fleet():
+def build_fleet(prune=False):
     reg = D.load_registry()
     old = D.load_fleet() or {}
+    retired = set(old.get("retired") or [])
     watchers = pm2_watchers()
+    panes = tmux_panes()
     sessions = {s["pane"]: s for s in D.claude_sessions() if s["pane"]}
     handles = {}
     # start from the existing fleet.json so hand-edited fields survive
     for h, ent in (old.get("handles") or {}).items():
-        handles[h] = dict(ent)
+        if h not in retired:
+            handles[h] = dict(ent)
     for pane, ent in reg.items():
         h = ent.get("handle")
-        if not h:
+        if not h or h in retired:
             continue
         cur = handles.setdefault(h, {})
         cur.setdefault("token", ent.get("token"))
@@ -89,43 +101,147 @@ def build_fleet():
         if w:
             cur["watcher"] = w["name"]
             cur["watcher_pane"] = w["pane"]
+        else:
+            cur.pop("watcher", None)
+            cur.pop("watcher_pane", None)
         s = sessions.get(cur.get("pane"))
         if s:
             cur["session_name"] = s["name"]
             cur["cwd"] = s["cwd"]
             cur["session_id"] = s["session_id"]
+    pruned = []
+    if prune:
+        for h in list(handles):
+            cur = handles[h]
+            if cur.get("pane") not in panes and h not in watchers:
+                pruned.append(h)
+                del handles[h]
+                retired.add(h)
     return {
         "version": 1,
         "generated_at": time.strftime("%Y-%m-%d %H:%M:%S%z"),
         "url": old.get("url") or D.server_url(),
         "tmux_tmpdir": old.get("tmux_tmpdir") or os.environ.get("TMUX_TMPDIR") or "/var/solana/data/tmp",
         "handles": dict(sorted(handles.items())),
-    }
+        "retired": sorted(retired),
+    }, pruned
 
 
-def cmd_sync(write):
-    fleet = build_fleet()
+def write_fleet(fleet):
     os.makedirs(D.CFG, exist_ok=True)
     tmp = FLEET_PATH + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(fleet, f, indent=2, ensure_ascii=False)
         f.write("\n")
     os.replace(tmp, FLEET_PATH)
+
+
+def write_registry_from(fleet):
+    reg = {}
+    for h, ent in fleet["handles"].items():
+        if ent.get("pane") and ent.get("token"):
+            reg[ent["pane"]] = {"handle": h, "token": ent["token"], "runtime": ent.get("runtime", "claude")}
+    if os.path.exists(REG_PATH):
+        bak = REG_PATH + ".bak-fleet-%d" % int(time.time())
+        os.replace(REG_PATH, bak)
+        print("registry.json backed up to %s" % bak)
+    with open(REG_PATH, "w", encoding="utf-8") as f:
+        json.dump(reg, f, indent=2)
+        f.write("\n")
+    print("registry.json regenerated: %d panes" % len(reg))
+
+
+def cmd_sync(write, prune):
+    fleet, pruned = build_fleet(prune=prune)
+    write_fleet(fleet)
     print("fleet.json: %d handles -> %s" % (len(fleet["handles"]), FLEET_PATH))
+    if pruned:
+        print("pruned (no pane, no watcher): %s" % ", ".join(pruned))
+    if fleet.get("retired"):
+        print("retired (never re-added by sync): %s" % ", ".join(fleet["retired"]))
     if write:
-        reg = {}
-        for h, ent in fleet["handles"].items():
-            if ent.get("pane") and ent.get("token"):
-                reg[ent["pane"]] = {"handle": h, "token": ent["token"], "runtime": ent.get("runtime", "claude")}
-        if os.path.exists(REG_PATH):
-            bak = REG_PATH + ".bak-fleet-%d" % int(time.time())
-            os.replace(REG_PATH, bak)
-            print("registry.json backed up to %s" % bak)
+        write_registry_from(fleet)
+    return 0
+
+
+def cmd_remove(handle, watcher):
+    fleet = D.load_fleet()
+    if not fleet:
+        D.die("no fleet.json at %s — run: dispatch-fleet sync" % FLEET_PATH)
+    ent = (fleet.get("handles") or {}).pop(handle, None)
+    retired = set(fleet.get("retired") or [])
+    retired.add(handle)
+    fleet["retired"] = sorted(retired)
+    fleet["generated_at"] = time.strftime("%Y-%m-%d %H:%M:%S%z")
+    write_fleet(fleet)
+    print("fleet.json: removed %s%s (now in retired list)" % (handle, "" if ent else " (was not present)"))
+    reg = D.load_registry()
+    dropped = [p for p, e in reg.items() if e.get("handle") == handle]
+    if dropped:
+        for p in dropped:
+            del reg[p]
+        bak = REG_PATH + ".bak-remove-%s-%d" % (handle, int(time.time()))
+        os.replace(REG_PATH, bak)
         with open(REG_PATH, "w", encoding="utf-8") as f:
             json.dump(reg, f, indent=2)
             f.write("\n")
-        print("registry.json regenerated: %d panes" % len(reg))
+        print("registry.json: dropped pane(s) %s (backup %s)" % (", ".join(dropped), bak))
+    if watcher:
+        rc, out = sh(["pm2", "delete", "watch-" + handle], timeout=20)
+        print("pm2 delete watch-%s: %s" % (handle, "ok" if rc == 0 else "failed/not found"))
+    else:
+        w = pm2_watchers().get(handle)
+        if w:
+            print("note: pm2 watcher %s still exists — rerun with --watcher or: pm2 delete %s" % (w["name"], w["name"]))
+    print("note: the server user is untouched; to delete it: node src/admin.js remove %s" % handle)
     return 0
+
+
+WATCHER_SCRIPT = "/var/solana/data/dispatch-mcp/skills/dispatch-worktree/scripts/dispatch-watch.js"
+WATCHER_PROMPT = ("Run ~/.dispatch/dispatch-recv to read new dispatch message(s), act on them, "
+                  "then reply with ~/.dispatch/dispatch-send <who> ...")
+
+
+def cmd_watchers(restart, only):
+    fleet = D.load_fleet()
+    if not fleet:
+        D.die("no fleet.json at %s — run: dispatch-fleet sync" % FLEET_PATH)
+    script = os.environ.get("DISPATCH_WATCHER_SCRIPT") or WATCHER_SCRIPT
+    existing = pm2_watchers()
+    rc_all = 0
+    for h, ent in sorted(fleet["handles"].items()):
+        if only and h != only:
+            continue
+        if not ent.get("pane") or not ent.get("token"):
+            print("skip %s: no pane/token" % h)
+            continue
+        name = "watch-" + h
+        env = dict(os.environ)
+        env.update({
+            "DISPATCH_URL": (fleet.get("url") or D.server_url()) + "/events",
+            "DISPATCH_TOKEN": ent["token"],
+            "TMUX_TARGET": ent["pane"],
+            "TMUX_TMPDIR": fleet.get("tmux_tmpdir") or os.environ.get("TMUX_TMPDIR") or "/var/solana/data/tmp",
+            "DISPATCH_PROMPT": WATCHER_PROMPT,
+            "DISPATCH_IDLE_POLL_MS": "1500",
+            "DISPATCH_MIN_WAKE_PRIORITY": os.environ.get("DISPATCH_MIN_WAKE_PRIORITY", "medium"),
+            "DISPATCH_FLEET": FLEET_PATH,
+        })
+        if h in existing:
+            if not restart:
+                print("%s: already running (pane %s) — use --restart to re-derive env" % (name, existing[h]["pane"]))
+                continue
+            sh(["pm2", "delete", name], timeout=20)
+        try:
+            r = subprocess.run(["pm2", "start", script, "--name", name, "--interpreter", "node", "-f"],
+                               env=env, capture_output=True, text=True, timeout=30)
+            ok = r.returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            ok = False
+        print("%s %s (pane %s)" % ("started" if ok else "FAILED", name, ent["pane"]))
+        if not ok:
+            rc_all = 1
+    return rc_all
 
 
 def cmd_show():
@@ -141,7 +257,7 @@ def cmd_show():
 
 
 def cmd_check(as_json=False):
-    fleet = D.load_fleet() or build_fleet()
+    fleet = D.load_fleet() or build_fleet()[0]
     panes = tmux_panes()
     watchers = pm2_watchers()
     sessions = {s["pane"]: s for s in D.claude_sessions() if s["pane"]}
@@ -234,7 +350,17 @@ def main(argv):
     if cmd == "check":
         return cmd_check(as_json="--json" in argv)
     if cmd == "sync":
-        return cmd_sync(write="--write" in argv)
+        return cmd_sync(write="--write" in argv, prune="--prune" in argv)
+    if cmd == "remove":
+        if len(argv) < 2 or argv[1].startswith("-"):
+            D.die("usage: dispatch-fleet remove <handle> [--watcher]", 2)
+        return cmd_remove(argv[1], watcher="--watcher" in argv)
+    if cmd == "watchers":
+        only = None
+        if "--only" in argv:
+            i = argv.index("--only")
+            only = argv[i + 1] if i + 1 < len(argv) else None
+        return cmd_watchers(restart="--restart" in argv, only=only)
     if cmd == "show":
         return cmd_show()
     D.die("dispatch-fleet: unknown command %s\n%s" % (cmd, __doc__.strip()), 2)

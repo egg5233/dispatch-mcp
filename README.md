@@ -126,10 +126,16 @@ dispatch-recv [--limit N] [--priority high+] [--all] [--since <id>]
     Everything drained is appended to ~/.dispatch/spool-<handle>.jsonl. --since uses the server,
     falls back to the spool when the server is down.
 
-dispatch-fleet check [--json] | sync [--write] | show
+dispatch-fleet check [--json] | sync [--write] [--prune] | remove <handle> [--watcher]
+               | watchers [--restart] [--only <handle>] | show
     check: per handle — pane, runtime, pane_current_command vs expected (claude→claude, codex→node),
     watcher pm2 status + pane drift, Claude session name/status, server state/unread/open tasks;
-    exit 1 on any problem. sync: (re)build fleet.json; --write also regenerates registry.json.
+    exit 1 on any problem. sync: refresh fleet.json; --prune retires handles with no pane AND no
+    watcher; --write also regenerates registry.json. remove: retire a handle from fleet.json and
+    registry.json (kept in fleet.json "retired" so sync never resurrects it); --watcher also
+    pm2-deletes watch-<handle>. watchers: start (or --restart) one pm2 watch-<handle> per fleet.json
+    entry with env derived from fleet.json — this replaced the hand-maintained watchers.<host>.cjs
+    ecosystem file, which is deprecated (deploy-fleet.mjs no longer writes it).
 ```
 
 ### `~/.dispatch/fleet.json`
@@ -189,6 +195,10 @@ Every server call has a ≤ 2 s timeout; if the server is unreachable the hook e
 | `JWT_SECRET`, `JWT_COOKIE_SECURE` | generated / unset | dashboard cookie (see Dashboard) |
 
 Watcher (`skills/dispatch-worktree/scripts/dispatch-watch.js`, one pm2 `watch-<handle>` per pane): `DISPATCH_URL`, `DISPATCH_TOKEN`, `TMUX_TARGET`, `DISPATCH_PROMPT`, guards `DISPATCH_EXPECT_CMD` / `DISPATCH_HUMAN_IDLE_MS` / `DISPATCH_GUARDS_OFF`, `DISPATCH_MIN_WAKE_PRIORITY` (default `medium`: `low` messages never trigger a keystroke wake; logged as `no wake`), and `DISPATCH_FLEET` (default `~/.dispatch/fleet.json`, consulted before `registry.json` for the expected foreground command). Guard C tells an empty composer from a half-typed one by *styling*: every TUI here renders its hint with SGR 2 (dim) and human input carries no dim attribute, so the capture is taken with `-e` and dim runs are stripped first (a literal hint list loses because Codex rotates its hint).
+
+## Enabling the hooks fleet-wide
+
+`deploy/enable-hooks.py [--dry-run]` appends the block to `~/.claude/settings.json` without touching existing hook groups (idempotent; backup at the fixed name `~/.claude/settings.json.bak-dispatch-hooks`); `--rollback` restores that backup (`cp ~/.claude/settings.json.bak-dispatch-hooks ~/.claude/settings.json` does the same). Cost for a session whose pane is not in `fleet.json`: the hook resolves no identity and exits before any network call — ~68 ms per event (median of 20, max 77 ms, measured 2026-09-03); a fleet pane pays ~100–120 ms for one `GET /hook/digest` plus one `POST /presence`.
 
 ## Codex sessions (0.148)
 

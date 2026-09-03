@@ -1,18 +1,11 @@
 #!/usr/bin/env bash
-# Launch a pm2 watcher per registered pane. Usage: launch-watchers.sh <base_url> <tmux_tmpdir> [handle-filter]
+# Launch a pm2 watcher per fleet.json handle. Usage: launch-watchers.sh [--restart] [--only <handle>]
+# Since dispatch v2 P1 this is a thin wrapper over `dispatch-fleet watchers`, which derives every
+# watcher's env from ~/.dispatch/fleet.json (the single registry). The old pane-keyed
+# registry.json and the generated watchers.<host>.cjs ecosystem are no longer used to start
+# watchers — the .cjs file drifted from reality (stale pane ids, phantom handles) because it
+# was a one-time snapshot. Requires: dispatch-fleet sync (or deploy-fleet.mjs) first.
 set -euo pipefail
-BASE="${1:?base url e.g. http://127.0.0.1:7900}"
-TTD="${2:?tmux tmpdir e.g. /var/solana/data/tmp}"
-ONLY="${3:-}"
-REG="$HOME/.dispatch/registry.json"
-WATCHER="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/skills/dispatch-worktree/scripts/dispatch-watch.js"
-PROMPT='Run ~/.dispatch/dispatch-recv to read new dispatch message(s), act on them, then reply with ~/.dispatch/dispatch-send <who> ...'
-mapfile -t ROWS < <(python3 -c "import json;[print(p,d['handle'],d['token']) for p,d in json.load(open('$REG')).items()]")
-for row in "${ROWS[@]}"; do
-  read -r pane handle token <<<"$row"
-  [ -n "$ONLY" ] && [ "$handle" != "$ONLY" ] && continue
-  DISPATCH_URL="$BASE/events" DISPATCH_TOKEN="$token" TMUX_TARGET="$pane" TMUX_TMPDIR="$TTD" \
-    DISPATCH_PROMPT="$PROMPT" DISPATCH_IDLE_POLL_MS=1500 DISPATCH_MIN_WAKE_PRIORITY="${DISPATCH_MIN_WAKE_PRIORITY:-medium}" \
-    pm2 start "$WATCHER" --name "watch-$handle" --interpreter node --update-env -f >/dev/null 2>&1 \
-    && echo "started watch-$handle ($pane)"
-done
+FLEET_CLI="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/cli/dispatch-fleet"
+[ -x "$HOME/.dispatch/dispatch-fleet" ] && FLEET_CLI="$HOME/.dispatch/dispatch-fleet"
+exec python3 "$FLEET_CLI" watchers "$@"

@@ -68,8 +68,11 @@ for (const [pane, handle, runtime] of table) {
   fleet.handles[handle] = { token: registry[pane].token, runtime, pane, watcher: `watch-${handle}` };
 }
 writeFileSync(join(cfg, "fleet.json"), JSON.stringify(fleet, null, 2) + "\n");
-writeFileSync(join(cfg, `watchers.${HOST}.cjs`), "module.exports = " + JSON.stringify({ apps }, null, 2) + ";\n");
+// watchers.<host>.cjs is DEPRECATED (2026-09-03): a one-time snapshot that drifted from the
+// live fleet. Watchers are now started from fleet.json by `dispatch-fleet watchers`
+// (deploy/launch-watchers.sh). The ecosystem file is no longer written.
+void apps;
 console.log(`registry: ${Object.keys(registry).length} panes -> ${join(cfg,"registry.json")}`);
-console.log(`ecosystem: ${join(cfg, `watchers.${HOST}.cjs`)}`);
+console.log(`watchers:  dispatch-fleet watchers   (watchers.${HOST}.cjs is deprecated, not written)`);
 console.log(`fleet:     ${join(cfg, "fleet.json")}`);
 for (const [p,h] of table.map(t=>[t[0],t[1]])) console.log(`  ${p}  ${h}`);

@@ -63,9 +63,14 @@ writeFileSync(join(cfg, "registry.json"), JSON.stringify(registry, null, 2));
 // fleet.json (P1): handle-keyed single source of truth. registry.json above is
 // the pane-keyed compatibility view; `dispatch-fleet sync --write` regenerates
 // it from fleet.json later on.
-const fleet = { version: 1, generated_at: new Date().toISOString(), url: URL[HOST], tmux_tmpdir: TMUX_TMPDIR[HOST], handles: {} };
+// Multi-project (T-20260903-20): this bootstrap table is all Pearl; the
+// `dispatch` platform project (dispatch-dev, coordinated by Pearl's coord) and
+// any further project are added with `dispatch-fleet project add` afterwards.
+const fleet = { version: 1, generated_at: new Date().toISOString(), url: URL[HOST], tmux_tmpdir: TMUX_TMPDIR[HOST],
+  projects: { pearl: { coordination_dir: "/var/solana/data/pearl_workspace/coordination", tmux_session: "pearl", coordinator: "coord" } },
+  handles: {} };
 for (const [pane, handle, runtime] of table) {
-  fleet.handles[handle] = { token: registry[pane].token, runtime, pane, watcher: `watch-${handle}` };
+  fleet.handles[handle] = { token: registry[pane].token, runtime, pane, project: "pearl", watcher: `watch-${handle}` };
 }
 writeFileSync(join(cfg, "fleet.json"), JSON.stringify(fleet, null, 2) + "\n");
 // watchers.<host>.cjs is DEPRECATED (2026-09-03): a one-time snapshot that drifted from the

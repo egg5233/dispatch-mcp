@@ -13,6 +13,14 @@ import {
   deleteAllTasks,
   pruneTasks,
   listTasks,
+  listProjects,
+  getProject,
+  upsertProject,
+  removeProject,
+  setUserProject,
+  handlesInProject,
+  projectSummary,
+  PROJECT_NAME_RE,
 } from "./store.js";
 import {
   registerRepo,
@@ -26,11 +34,33 @@ import readline from "readline";
 
 const [cmd, arg] = process.argv.slice(2);
 
+// --flag value / --flag=value lookup over the whole argv (order-independent).
+function flag(name) {
+  const argv = process.argv;
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === name) return i + 1 < argv.length ? argv[i + 1] : null;
+    if (argv[i].startsWith(name + "=")) return argv[i].slice(name.length + 1);
+  }
+  return null;
+}
+const hasFlag = (name) => process.argv.includes(name);
+const JSON_OUT = hasFlag("--json");
+function out(obj, text) {
+  if (JSON_OUT) console.log(JSON.stringify(obj));
+  else if (text) console.log(text);
+}
+
 function usage() {
   console.log(`Usage:
 
 Users:
-  node src/admin.js add <handle>             Create a user and print their bearer token
+  node src/admin.js add <handle> [--project <p>] [--json]
+                                             Create a user and print their bearer token
+  node src/admin.js ensure <handle> [--project <p>] [--json]
+                                             Create if missing, else reuse (and re-assign project if given);
+                                             prints the token either way — safe to re-run
+  node src/admin.js set-project <handle> <project|->
+                                             Assign a user to a project (- clears); tasks are backfilled
   node src/admin.js list                     List all users
   node src/admin.js remove <handle>          Delete a user
   node src/admin.js rotate <handle>          Issue a fresh token (old one stops working)
@@ -42,6 +72,12 @@ Repos (server-side bare clones for commit verification):
   node src/admin.js list-repos               List all registered repos
   node src/admin.js fetch-repo <name>        git fetch origin for a registered repo
   node src/admin.js remove-repo <name>       Unregister a repo and delete its bare clone
+
+Projects (multi-project namespace — a coordinator, its agents, a coordination/ dir):
+  node src/admin.js project add <name> [--dir <coordination_dir>] [--session <tmux>] [--coordinator <handle>]
+  node src/admin.js project list [--json]
+  node src/admin.js project remove <name> [--force]   refuses while handles are still assigned unless --force
+                                                      (--force clears their project first)
 
 Tasks:
   node src/admin.js delete-task <id>         Delete one task by id (and its comments)
@@ -170,8 +206,14 @@ switch (cmd) {
   case "add": {
     if (!arg) usage();
     try {
-      const { handle, token } = addUser(arg);
-      console.log(`\nCreated user: ${handle}`);
+      const project = flag("--project");
+      if (project && !getProject(project)) {
+        console.error(`Error: unknown project '${project}'. Create it first: node src/admin.js project add ${project} ...`);
+        process.exit(1);
+      }
+      const { handle, token } = addUser(arg, project);
+      if (JSON_OUT) { console.log(JSON.stringify({ handle, token, project: project || null, created: true })); break; }
+      console.log(`\nCreated user: ${handle}${project ? ` (project ${project})` : ""}`);
       console.log(`Bearer token: ${token}\n`);
       printClientConfig(token);
     } catch (e) {
@@ -183,6 +225,74 @@ switch (cmd) {
       process.exit(1);
     }
     break;
+  }
+
+  case "ensure": {
+    if (!arg) usage();
+    const project = flag("--project");
+    if (project && !getProject(project)) {
+      console.error(`Error: unknown project '${project}'. Create it first: node src/admin.js project add ${project} ...`);
+      process.exit(1);
+    }
+    let u = getUserByHandle(arg);
+    let created = false;
+    if (!u) {
+      addUser(arg, project);
+      u = getUserByHandle(arg);
+      created = true;
+    } else if (project && u.project !== project) {
+      setUserProject(arg, project);
+      u = getUserByHandle(arg);
+    }
+    out({ handle: u.handle, token: u.token, project: u.project || null, created },
+      `${created ? "Created" : "Reused"} user ${u.handle}${u.project ? ` (project ${u.project})` : ""}\nBearer token: ${u.token}`);
+    break;
+  }
+
+  case "set-project": {
+    const [, , , handle, project] = process.argv;
+    if (!handle || !project) { console.error("Usage: node src/admin.js set-project <handle> <project|->"); process.exit(1); }
+    if (!getUserByHandle(handle)) { console.error(`User not found: ${handle}`); process.exit(1); }
+    const p = project === "-" ? null : project;
+    if (p && !getProject(p)) { console.error(`Unknown project '${p}'. Create it first: node src/admin.js project add ${p} ...`); process.exit(1); }
+    setUserProject(handle, p);
+    out({ handle, project: p }, `${handle} → project ${p || "(none)"}`);
+    break;
+  }
+
+  case "project": {
+    const sub = process.argv[3];
+    const name = process.argv[4];
+    if (sub === "add") {
+      if (!name || !PROJECT_NAME_RE.test(name)) { console.error("Usage: node src/admin.js project add <name> [--dir D] [--session S] [--coordinator H]   (name: [a-z0-9][a-z0-9_-]*)"); process.exit(1); }
+      const p = upsertProject({ name, coordination_dir: flag("--dir"), tmux_session: flag("--session"), coordinator: flag("--coordinator") });
+      const warn = p.coordinator && !getUserByHandle(p.coordinator) ? ` (note: coordinator '${p.coordinator}' has no server account yet)` : "";
+      out(p, `project ${p.name}: dir=${p.coordination_dir || "-"} session=${p.tmux_session || "-"} coordinator=${p.coordinator || "-"}${warn}`);
+      break;
+    }
+    if (sub === "list") {
+      const sum = projectSummary();
+      if (JSON_OUT) { console.log(JSON.stringify(sum)); break; }
+      if (!sum.projects.length) console.log("No projects. Add one with: node src/admin.js project add <name> --dir <coordination_dir> --session <tmux> --coordinator <handle>");
+      else console.table(sum.projects.map((p) => ({ name: p.name, coordinator: p.coordinator + (p.coordinator_exists ? "" : " (no account)"), handles: p.handle_count, tmux_session: p.tmux_session, coordination_dir: p.coordination_dir })));
+      if (sum.unassigned.length) console.log(`unassigned handles (no project): ${sum.unassigned.join(", ")}`);
+      break;
+    }
+    if (sub === "remove") {
+      if (!name) { console.error("Usage: node src/admin.js project remove <name> [--force]"); process.exit(1); }
+      if (!getProject(name)) { console.error(`Project not found: ${name}`); process.exit(1); }
+      const hs = handlesInProject(name);
+      if (hs.length && !hasFlag("--force")) {
+        console.error(`Refusing: ${hs.length} handle(s) still in project ${name}: ${hs.join(", ")}. Reassign them (set-project) or pass --force to clear their project.`);
+        process.exit(1);
+      }
+      for (const h of hs) setUserProject(h, null);
+      removeProject(name);
+      out({ removed: name, cleared: hs }, `Removed project ${name}${hs.length ? ` (cleared project on ${hs.join(", ")})` : ""}`);
+      break;
+    }
+    console.error("Usage: node src/admin.js project add|list|remove ...");
+    process.exit(1);
   }
 
   case "list": {

@@ -11,6 +11,14 @@ import { toDisplayTz } from "./tz.js";
 export const TASKS_DIR =
   process.env.DISPATCH_TASKS_DIR || "/var/solana/data/pearl_workspace/coordination/tasks";
 
+// Multi-project (T-20260903-20): a task mirrors into its project's
+// coordination/tasks/. Tasks without a project (or a project without a
+// coordination_dir) keep using TASKS_DIR, i.e. exactly the pre-project path.
+export function tasksDirForProject(project) {
+  if (project && project.coordination_dir) return join(String(project.coordination_dir), "tasks");
+  return TASKS_DIR;
+}
+
 // Unicode-aware slug: letters and digits of any script survive (a Chinese
 // title stays readable), everything else collapses to "-", ≤ 40 code points.
 function slug(title) {
@@ -82,18 +90,18 @@ export function taskFilename(task) {
   return `${task.id}${sl ? "-" + sl : ""}.md`;
 }
 
-export function writeTaskMirror(task, health, thread) {
+export function writeTaskMirror(task, health, thread, dir = TASKS_DIR) {
   if (!task || !/^T-\d{8}-\d+$/.test(task.id)) return null;
   try {
-    mkdirSync(TASKS_DIR, { recursive: true });
+    mkdirSync(dir, { recursive: true });
     const name = taskFilename(task);
     // an older file for the same id with a different slug is renamed, not duplicated
-    for (const f of readdirSync(TASKS_DIR)) {
+    for (const f of readdirSync(dir)) {
       if (f !== name && f.startsWith(task.id) && f.endsWith(".md")) {
-        try { renameSync(join(TASKS_DIR, f), join(TASKS_DIR, name)); } catch { /* ignore */ }
+        try { renameSync(join(dir, f), join(dir, name)); } catch { /* ignore */ }
       }
     }
-    const path = join(TASKS_DIR, name);
+    const path = join(dir, name);
     const tmp = path + ".tmp";
     writeFileSync(tmp, renderTaskMarkdown(task, health, thread));
     renameSync(tmp, path);

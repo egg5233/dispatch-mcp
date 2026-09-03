@@ -1,6 +1,6 @@
 # Fleet dispatch — agent protocol (v2, 2026-09-03)
 
-跨 agent 訊息匯流排。伺服器 `:7900`（pm2 `dispatch`），CLI 在 `~/.dispatch/`。身分 = 你的 tmux pane（自動，`$TMUX_PANE` → `fleet.json`）。
+跨 agent 訊息匯流排。伺服器 `:7900`（pm2 `dispatch`），CLI 在 `~/.dispatch/`。身分 = 你的 tmux pane（自動，`$TMUX_PANE` → `fleet.json`）。每個 handle 屬於一個 **專案**（fleet.json `projects`）；`dispatch-send coord` 的 `coord` 由伺服器解析成**你所屬專案的 coordinator**（Pearl 的 coordinator 就是 handle `coord`，不變）。
 **規則來源**：`coordination/DISPATCH-V2-SPEC.md`（使用者拍板）；本檔是給 agent 的操作手冊。
 
 ## 收訊
@@ -20,7 +20,8 @@
 ## 發訊
 
 ```
-~/.dispatch/dispatch-send <handle|all> [旗標] "<body>"
+~/.dispatch/dispatch-send <handle|all|coord> [旗標] "<body>"
+  coord = 你所屬專案的 coordinator（伺服器解析；回覆會印 "sent -> coord-xxx (alias coord)"）
   --type task|question|request_permission|report|ack|info   (預設 info)
   --title "<標題>"               type=task 建議必填：存進 tasks.title、當鏡像檔名 slug；
                                  未給則取 body 第一行去掉 [TASK] 類前綴、截 80 字
@@ -29,6 +30,7 @@
   --re <msg id | task id>        回覆/ack/report 對象
   --task <T-id>                  明確指定任務
   --state done|continuing|waiting|blocked   (只給 --type report)
+  --project <name>               type=task：改歸到別的專案（預設 = 發送者的專案 → 該專案的 coordination/tasks/ 鏡像）
   --attach <path> ...            附檔（本機絕對路徑，可多個；不是上傳，i5 上的 agent 讀不到）
   --force                        只能配 --priority immediate（見下）
 ```
@@ -107,21 +109,24 @@
 ```
 備援：對閒置的 Claude handle，`dispatch-send` 會印 `hint: <handle> is idle (Claude session "<name>") — SendMessage(to="<name>")`，coord 可用原生 SendMessage 立即叫醒；Codex handle 維持 P0 的守衛式鍵盤 watcher（Codex 0.148 hooks 沒有 Stop 事件，見 README）。
 
-## Fleet
+## Fleet 與專案
 
-`~/.dispatch/fleet.json` 是唯一名冊（handle → token/runtime/pane/session_name）；`~/.dispatch/dispatch-fleet check` 印健康表（pane 前景程式是否等於 runtime、watcher 狀態、Claude session 名稱/閒忙、伺服器端未讀深度與 open tasks），`dispatch-fleet sync [--write]` 重建（`--write` 同時重生 registry.json 給舊工具）。
+`~/.dispatch/fleet.json` 是本機名冊（`projects.<name>` → coordination_dir/tmux_session/coordinator；`handles.<h>` → token/runtime/pane/project/session_name），伺服器 DB 存同一份（遠端 i5 的 handle 以伺服器為準）。`~/.dispatch/dispatch-fleet check` 印健康表（project、pane 前景程式是否等於 runtime、watcher 狀態、Claude session 名稱/閒忙、伺服器端未讀深度與 open tasks，加上每個專案 fleet.json＝伺服器、coordinator 有帳號），`dispatch-fleet sync [--write]` 重建（projects 與 project 欄位保留）。
 
-| handle | runtime | pane |
-|---|---|---|
-| coord | claude | %0 |
-| dispatch-dev | claude | %16 |
-| docs-migrate | claude | %17 |
-| kernel-2 | claude | %3 |
-| kernel-codex | codex | %5 |
-| kernel-h100 | claude | %2 |
-| pearl-infra | claude | %4 |
-| pearl-review | codex | %6 |
-| pearl-server | claude | %9 |
+專案規則：handle 全域唯一、只屬一個專案；`type=task` 歸發送者的專案，鏡像寫到該專案的 `coordination/tasks/`（Pearl 路徑與格式不變）；`dispatch-dev` 屬平台專案 `dispatch`（coordinator 仍是 Pearl 的 `coord`，任何 coordinator 都可直接發給它）。新專案：`dispatch-fleet project add <name> --dir … --session … --coordinator coord-<name>` → `dispatch-fleet add coord-<name> --project <name> --cwd … --runtime claude` → `dispatch-fleet add <name>-<role> …`（可 `--pane %N` 登記既有 pane）→ `dispatch-fleet check`。退場：每個 handle `dispatch-fleet remove <h> --watcher`，再 `dispatch-fleet project remove <name>`。Dashboard 右上角可切換專案。
+
+| handle | project | runtime | pane |
+|---|---|---|---|
+| coord | pearl | claude | %0 |
+| dispatch-dev | dispatch | claude | %16 |
+| docs-migrate | pearl | claude | %17 |
+| kernel-2 | pearl | claude | %3 |
+| kernel-codex | pearl | codex | %5 |
+| kernel-h100 | pearl | claude | %2 |
+| pearl-infra | pearl | claude | %4 |
+| pearl-review | pearl | codex | %6 |
+| pearl-server | pearl | claude | %9 |
+| pearl-dashboard / pearl-kernel-50 / pearl-miner (i5) | pearl | claude | remote |
 
 tmux-bridge / to-fleet remain as fallback.
 

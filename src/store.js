@@ -192,6 +192,38 @@ migrateColumn("presence", "state", "state TEXT");
 migrateColumn("presence", "state_at", "state_at TEXT");
 migrateColumn("presence", "session", "session TEXT");
 
+// ── multi-project (T-20260903-20) ──────────────────────────────────
+// One server, one DB, several projects. A project = a coordinator, its
+// agents and a coordination/ directory. Handles stay globally unique and
+// each belongs to at most one project (NULL = global, e.g. the `user`
+// decision account). Tasks record the project they were created under
+// (the sender's project) so the markdown mirror lands in that project's
+// coordination/tasks/. The DB is the server's truth; ~/.dispatch/fleet.json
+// mirrors it for this host's handles (dispatch-fleet keeps both in step).
+db.exec(`
+  CREATE TABLE IF NOT EXISTS projects (
+    name TEXT PRIMARY KEY,
+    coordination_dir TEXT,
+    tmux_session TEXT,
+    coordinator TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+`);
+migrateColumn("users", "project", "project TEXT");
+migrateColumn("tasks", "project", "project TEXT");
+// Backfill (idempotent, no flag): a task without a project takes its
+// creator's project, else its assignee's. Re-runs whenever handles get
+// assigned later (setUserProject calls it too).
+function backfillTaskProjects() {
+  return db.prepare(`
+    UPDATE tasks SET project = COALESCE(
+      (SELECT project FROM users WHERE handle = tasks.from_user),
+      (SELECT project FROM users WHERE handle = tasks.to_user))
+     WHERE project IS NULL`).run().changes;
+}
+backfillTaskProjects();
+
 // Priority vocabulary is now low | medium | high | immediate. Legacy rows
 // used normal / urgent; map them once so ORDER BY and filters stay simple.
 db.exec(`UPDATE messages SET priority = 'medium'    WHERE priority = 'normal'`);
@@ -278,8 +310,8 @@ const stmts = {
       id, kind, type, title, description, files,
       from_user, to_user, priority,
       repo, base_branch, base_commit, head_branch, head_commit, pr_url,
-      ack_required, documents, thread_id
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ack_required, documents, thread_id, project
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `),
   lastTaskIdForDay: db.prepare(`
     SELECT id FROM tasks WHERE id LIKE ? ORDER BY id DESC LIMIT 1
@@ -396,11 +428,11 @@ const stmts = {
   getUserByToken: db.prepare(`SELECT * FROM users WHERE token = ?`),
   getUserByHandle: db.prepare(`SELECT * FROM users WHERE handle = ?`),
   listUsers: db.prepare(`
-    SELECT handle, created_at, last_seen_at, last_seen_ip FROM users ORDER BY handle
+    SELECT handle, created_at, last_seen_at, last_seen_ip, project FROM users ORDER BY handle
   `),
   createUser: db.prepare(`
-    INSERT INTO users (handle, token, last_message_seen_at)
-    VALUES (?, ?, datetime('now'))
+    INSERT INTO users (handle, token, last_message_seen_at, project)
+    VALUES (?, ?, datetime('now'), ?)
   `),
   deleteUser: db.prepare(`DELETE FROM users WHERE handle = ?`),
   rotateUserToken: db.prepare(`UPDATE users SET token = ? WHERE handle = ?`),
@@ -583,6 +615,7 @@ export function createTask({
   ack_required = 0,
   documents = [],
   thread_id = null,
+  project = null,
 }) {
   const taskId = id || randomUUID().slice(0, 8);
   stmts.createTask.run(
@@ -603,7 +636,8 @@ export function createTask({
     pr_url,
     ack_required ? 1 : 0,
     JSON.stringify(documents || []),
-    thread_id
+    thread_id,
+    project || null
   );
   return getTask(taskId);
 }
@@ -621,7 +655,7 @@ export function deriveTaskTitle(body, explicit = null) {
 
 // Task spawned by a type=task message. The message id becomes thread_id so
 // replies with --re <msg id> resolve back to the task.
-export function createTaskFromMessage(msg, explicitTitle = null) {
+export function createTaskFromMessage(msg, explicitTitle = null, project = null) {
   const title = deriveTaskTitle(msg.body, explicitTitle);
   const ackRequired =
     msg.ack === "yes" || (msg.ack === "auto" && (msg.priority === "high" || msg.priority === "immediate"));
@@ -642,6 +676,7 @@ export function createTaskFromMessage(msg, explicitTitle = null) {
           ? msg.attachments
           : JSON.parse(msg.attachments || "[]"),
         thread_id: msg.id,
+        project,
       });
     } catch (e) {
       if (e.code !== "SQLITE_CONSTRAINT_PRIMARYKEY" || attempt === 2) throw e;
@@ -989,9 +1024,16 @@ export function recentDeliveries(sinceUtc) {
 
 // Free-form message listing for the dashboard (all messages, not per-identity).
 export function listMessages({ from = null, to = null, type = null, priority = null, status = null,
-  since = null, until = null, q = null, task = null, limit = 200 } = {}) {
+  since = null, until = null, q = null, task = null, limit = 200, handles = null } = {}) {
   const where = [];
   const args = [];
+  // project scope: either party belongs to the project (an empty handle
+  // list matches nothing, so an unknown project yields no rows)
+  if (Array.isArray(handles)) {
+    const ph = handles.map(() => "?").join(",") || "NULL";
+    where.push(`(from_user IN (${ph}) OR to_user IN (${ph}))`);
+    args.push(...handles, ...handles);
+  }
   if (from) { where.push("from_user = ?"); args.push(from); }
   if (to) {
     if (to === "all") where.push("to_user IS NULL");
@@ -1039,12 +1081,25 @@ export function reportsForTask(taskId) {
   return stmts.reportsForTask.all(taskId);
 }
 
-export function openRequests() {
-  return parseAttachments(stmts.openRequests.all());
+export function openRequests({ handles = null } = {}) {
+  const rows = parseAttachments(stmts.openRequests.all());
+  if (!Array.isArray(handles)) return rows;
+  const set = new Set(handles);
+  return rows.filter((m) => set.has(m.from_user) || (m.to_user && set.has(m.to_user)));
 }
 
-export function listAllTasks(limit = 300) {
-  return stmts.allTasksRecent.all(limit).map((t) => {
+export function listAllTasks(limit = 300, { project = null, handles = null } = {}) {
+  let rows;
+  if (project) {
+    // a project's board = tasks created under it + tasks assigned to its agents
+    const hs = Array.isArray(handles) ? handles : handlesInProject(project);
+    const ph = hs.map(() => "?").join(",") || "NULL";
+    rows = db.prepare(`SELECT * FROM tasks WHERE project = ? OR to_user IN (${ph}) OR claimed_by IN (${ph})
+                        ORDER BY created_at DESC LIMIT ?`).all(project, ...hs, ...hs, limit);
+  } else {
+    rows = stmts.allTasksRecent.all(limit);
+  }
+  return rows.map((t) => {
     try { t.files = JSON.parse(t.files); } catch { t.files = []; }
     try { t.documents = JSON.parse(t.documents || "[]"); } catch { t.documents = []; }
     return t;
@@ -1121,10 +1176,81 @@ export function listUsers() {
   return stmts.listUsers.all();
 }
 
-export function addUser(handle) {
+export function addUser(handle, project = null) {
   const token = `${handle}-${randomUUID()}`;
-  stmts.createUser.run(handle, token);
-  return { handle, token };
+  stmts.createUser.run(handle, token, project || null);
+  return { handle, token, project: project || null };
+}
+
+// ── projects ───────────────────────────────────────────────────────
+export const PROJECT_NAME_RE = /^[a-z0-9][a-z0-9_-]{0,39}$/;
+
+export function listProjects() {
+  return db.prepare(`SELECT * FROM projects ORDER BY name`).all();
+}
+
+export function getProject(name) {
+  if (!name) return null;
+  return db.prepare(`SELECT * FROM projects WHERE name = ?`).get(String(name)) || null;
+}
+
+// Create or update. A null field never clears an existing value, so
+// `project add` is safe to re-run with a subset of the flags.
+export function upsertProject({ name, coordination_dir = null, tmux_session = null, coordinator = null }) {
+  if (!PROJECT_NAME_RE.test(String(name || ""))) throw new Error(`bad project name '${name}' (use [a-z0-9][a-z0-9_-]*, ≤ 40 chars)`);
+  db.prepare(`
+    INSERT INTO projects (name, coordination_dir, tmux_session, coordinator) VALUES (?, ?, ?, ?)
+    ON CONFLICT(name) DO UPDATE SET
+      coordination_dir = COALESCE(excluded.coordination_dir, projects.coordination_dir),
+      tmux_session     = COALESCE(excluded.tmux_session, projects.tmux_session),
+      coordinator      = COALESCE(excluded.coordinator, projects.coordinator),
+      updated_at       = datetime('now')
+  `).run(name, coordination_dir || null, tmux_session || null, coordinator || null);
+  return getProject(name);
+}
+
+export function removeProject(name) {
+  const r = db.prepare(`DELETE FROM projects WHERE name = ?`).run(name);
+  return r.changes > 0;
+}
+
+export function handlesInProject(name) {
+  if (!name) return [];
+  return db.prepare(`SELECT handle FROM users WHERE project = ? ORDER BY handle`).all(name).map((r) => r.handle);
+}
+
+export function projectOf(handle) {
+  if (!handle) return null;
+  const r = db.prepare(`SELECT project FROM users WHERE handle = ?`).get(handle);
+  return r ? r.project || null : null;
+}
+
+// The coordinator handle an agent means when it writes `coord`.
+export function coordinatorFor(handle) {
+  const p = getProject(projectOf(handle));
+  return p ? p.coordinator || null : null;
+}
+
+export function setUserProject(handle, project) {
+  const r = db.prepare(`UPDATE users SET project = ? WHERE handle = ?`).run(project || null, handle);
+  if (r.changes) backfillTaskProjects();
+  return r.changes > 0;
+}
+
+// Per project: registry row + handle count + whether the coordinator has
+// a server account. `unassigned` = handles that carry no project.
+export function projectSummary() {
+  const projects = listProjects().map((p) => {
+    const handles = handlesInProject(p.name);
+    return {
+      ...p,
+      handles,
+      handle_count: handles.length,
+      coordinator_exists: !!(p.coordinator && stmts.getUserByHandle.get(p.coordinator)),
+    };
+  });
+  const unassigned = db.prepare(`SELECT handle FROM users WHERE project IS NULL ORDER BY handle`).all().map((r) => r.handle);
+  return { projects, unassigned };
 }
 
 export function removeUser(handle) {

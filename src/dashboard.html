@@ -138,6 +138,7 @@
   <header>
     <div class="logo"><div class="logo-icon">D</div><h1>dispatch <span>/ 指揮面板</span></h1></div>
     <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+      <select id="project" class="live" title="專案切換：inbox / 任務板 / 待決定 / Fleet 只顯示該專案（記在這個瀏覽器）" style="cursor:pointer"><option value="all">專案：全部</option></select>
       <div class="live" id="live"><span class="dot"></span><span id="live-text">連線中…</span></div>
       <div class="live" id="me">—</div>
     </div>
@@ -201,6 +202,8 @@
 
   <!-- ── Fleet ── -->
   <div class="panel" id="panel-fleet">
+    <div class="section-title">專案（fleet.json projects ＝ 伺服器 projects 表）</div>
+    <div class="card" id="fleet-projects" style="font-family:var(--mono);font-size:12px;display:flex;gap:8px;flex-wrap:wrap"></div>
     <div class="section-title">Fleet 健康（伺服器端執行 dispatch-fleet check，每 5 秒快取）<span id="fleet-when" class="dim" style="font-family:var(--mono);font-size:11px;letter-spacing:0"></span></div>
     <div class="card" style="overflow:auto"><table id="fleet-table"></table></div>
     <div class="section-title">Remote（伺服器有帳號、但不在本機 fleet.json 的 handle，例如 i5 上的 agent）</div>
@@ -230,7 +233,20 @@
 const API = window.location.origin + '/api';
 const $ = (id) => document.getElementById(id);
 let ME = null, HANDLES = [], selectedId = null, replyTo = null;
-const state = { messages: [], tasks: [], thresholds: {}, decisions: [], fleet: null, inbox: null };
+const state = { messages: [], tasks: [], thresholds: {}, decisions: [], fleet: null, inbox: null, projects: [] };
+// ── project switcher (multi-project D5): scopes every panel; remembered per browser ──
+let PROJECT = 'all';
+try { PROJECT = localStorage.getItem('dispatch.project') || 'all'; } catch (e) {}
+function pq(extra){const p=new URLSearchParams(extra||'');if(PROJECT&&PROJECT!=='all')p.set('project',PROJECT);const q=p.toString();return q?'?'+q:'';}
+function projTag(name){return name?`<span class="tag dim" title="project">${esc(name)}</span>`:'';}
+async function loadProjects(){
+  const d=await j(`${API}/projects`);state.projects=d.projects||[];
+  const sel=$('project');const names=state.projects.map(p=>p.name);
+  sel.innerHTML='<option value="all">專案：全部</option>'+state.projects.map(p=>`<option value="${esc(p.name)}">專案：${esc(p.name)} (${p.handle_count})</option>`).join('');
+  if(PROJECT!=='all'&&!names.includes(PROJECT)){sel.innerHTML+=`<option value="${esc(PROJECT)}">專案：${esc(PROJECT)}（已不存在）</option>`;}
+  sel.value=PROJECT;
+}
+$('project').addEventListener('change',()=>{PROJECT=$('project').value||'all';try{localStorage.setItem('dispatch.project',PROJECT);}catch(e){}document.title=`dispatch — ${PROJECT==='all'?'指揮面板':PROJECT}`;refreshAll();});
 
 function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
 function toast(text, err){const t=$('toast');t.textContent=text;t.className='toast show'+(err?' err':'');clearTimeout(t._h);t._h=setTimeout(()=>t.className='toast',3500);}
@@ -271,16 +287,16 @@ async function loadMessages(){
   const p=new URLSearchParams();
   for(const [k,id] of [['from','f-from'],['to','f-to'],['type','f-type'],['priority','f-priority'],['status','f-status'],['q','f-q']]){const v=$(id).value.trim();if(v)p.set(k,v);}
   const s=sinceParam();if(s)p.set('since',s);p.set('limit',s?'500':'500');
-  const d=await j(`${API}/messages?${p}`);state.messages=d.messages;$('b-messages').textContent=d.count;renderMessages();
+  const d=await j(`${API}/messages${pq(p)}`);state.messages=d.messages;$('b-messages').textContent=d.count;renderMessages();
 }
 function renderInbox(){
   const ib=state.inbox;if(!ib)return;
   // every non-retired handle, local first then remote (server already sorts); the
   // `user` decision account is a human, shown last as remote.
   const rows=ib.handles;
-  $('inbox-stats').innerHTML=rows.length?rows.map(h=>`<div class="card stat-card ${h.kind==='remote'?'remote':''}"><div class="label">${esc(h.handle)} ${h.kind==='remote'?'<span class="tag via" title="不在本機 fleet.json（例如 i5）">remote</span>':''} <span class="${h.state==='busy'?'warn':h.state==='idle'?'ok':'dim'}">${esc(h.state||'')}</span></div><div class="value ${h.unread_high_plus?'bad':h.unread?'warn':'ok'}">${h.unread}</div><div class="dim" style="font-family:var(--mono);font-size:10px">${h.oldest_unread_age_s!=null?'最舊未讀 '+ago(h.oldest_unread_age_s):'無未讀'}${h.unacked_tasks.length?' · 未ack '+h.unacked_tasks.join(','):''}${h.open_tasks.length?' · open '+h.open_tasks.length:''}${h.kind==='remote'?'<br>last seen '+esc(h.last_seen_at||'never')+(h.last_seen_ip?' · '+esc(h.last_seen_ip):''):''}</div></div>`).join(''):'<div class="card stat-card"><div class="label">inbox</div><div class="value ok">0</div></div>';
+  $('inbox-stats').innerHTML=rows.length?rows.map(h=>`<div class="card stat-card ${h.kind==='remote'?'remote':''}"><div class="label">${esc(h.handle)} ${PROJECT==='all'?projTag(h.project):''}${h.kind==='remote'?'<span class="tag via" title="不在本機 fleet.json（例如 i5）">remote</span>':''} <span class="${h.state==='busy'?'warn':h.state==='idle'?'ok':'dim'}">${esc(h.state||'')}</span></div><div class="value ${h.unread_high_plus?'bad':h.unread?'warn':'ok'}">${h.unread}</div><div class="dim" style="font-family:var(--mono);font-size:10px">${h.oldest_unread_age_s!=null?'最舊未讀 '+ago(h.oldest_unread_age_s):'無未讀'}${h.unacked_tasks.length?' · 未ack '+h.unacked_tasks.join(','):''}${h.open_tasks.length?' · open '+h.open_tasks.length:''}${h.kind==='remote'?'<br>last seen '+esc(h.last_seen_at||'never')+(h.last_seen_ip?' · '+esc(h.last_seen_ip):''):''}</div></div>`).join(''):'<div class="card stat-card"><div class="label">inbox</div><div class="value ok">0</div></div>';
 }
-async function loadInbox(){state.inbox=await j(`${API}/inbox`);renderInbox();}
+async function loadInbox(){state.inbox=await j(`${API}/inbox${pq()}`);renderInbox();}
 
 const COLS=[['open','待認領'],['acked','已 ack'],['in_progress','進行中'],['waiting','等待中'],['blocked','卡住'],['pushed','已推送'],['closed','done'],['cancelled','取消']];
 function renderTasks(){
@@ -289,12 +305,12 @@ function renderTasks(){
   const overdue=state.tasks.filter(t=>t.health.overdue).length;
   $('b-tasks').textContent=state.tasks.filter(t=>!['closed','cancelled'].includes(t.status)).length;$('b-tasks').className='badge'+(overdue?' hot':'');
   $('board').innerHTML=COLS.map(([k,label])=>`<div class="col"><h3>${label}<span>${(by[k]||[]).length}</span></h3>${(by[k]||[]).map(t=>`<div class="task ${t.health.overdue?'overdue':''}" data-id="${esc(t.id)}" data-thread="${esc(t.thread_id||'')}">
-    <div class="id">${esc(t.id)}</div><div class="title">${esc(t.title)}</div>
+    <div class="id">${esc(t.id)} ${PROJECT==='all'?projTag(t.project):''}</div><div class="title">${esc(t.title)}</div>
     <div class="sub">${esc(t.from_user)} → ${esc(t.claimed_by||t.to_user||'?')} · ${esc(t.priority)}${t.ack_required?(t.acked_at?' · acked':' · <span class="warn">ACK!</span>'):''}<br>${t.health.last_report_at?'last report '+agoFromUtc(t.health.last_report_at)+' ago':'no report'} · ${t.health.reports.length} reports${t.health.trailing_continuing?' · '+t.health.trailing_continuing+'× CONT':''}<br>${esc(shortT(t.created_at_display))}</div>
     ${t.health.flags.map(f=>`<div class="flag">⚠ ${esc(f)}</div>`).join('')}${t.result?`<div class="sub ok">✓ ${esc(String(t.result).slice(0,120))}</div>`:''}</div>`).join('')}</div>`).join('');
   $('board').querySelectorAll('.task').forEach(el=>el.addEventListener('click',()=>{if(el.dataset.thread){showTab('messages');selectedId=el.dataset.thread;loadThread(selectedId);}}));
 }
-async function loadTasks(){const d=await j(`${API}/tasks`);state.tasks=d.tasks;state.thresholds=d.thresholds;$('s-hours').value=d.thresholds.staleHours;$('s-cont').value=d.thresholds.maxContinuing;renderTasks();}
+async function loadTasks(){const d=await j(`${API}/tasks${pq()}`);state.tasks=d.tasks;state.thresholds=d.thresholds;$('s-hours').value=d.thresholds.staleHours;$('s-cont').value=d.thresholds.maxContinuing;renderTasks();}
 
 function renderDecisions(){
   const el=$('decisions');$('b-decisions').textContent=state.decisions.length;$('b-decisions').className='badge'+(state.decisions.length?' hot':'');
@@ -302,7 +318,7 @@ function renderDecisions(){
   el.innerHTML=state.decisions.map(m=>`<div class="decision" data-id="${esc(m.id)}"><div class="who" style="font-family:var(--mono);font-size:12px;color:var(--text-dim)"><b style="color:var(--text)">${esc(m.from_user)}</b> → ${esc(m.to_user||'all')} · ${esc(m.created_at_display)} · ${esc(m.id)} ${msgTags(m)}</div><div class="body">${esc(m.body)}</div>${(m.attachments||[]).map(a=>`<div class="dim" style="font-family:var(--mono);font-size:11px">📎 ${esc(a.path||a)}</div>`).join('')}<div class="actions"><input placeholder="附註（選填）" data-note><select data-pri><option>high</option><option>immediate</option><option>medium</option></select><button class="btn go" data-go>GO</button><button class="btn nogo" data-nogo>NO-GO</button></div></div>`).join('');
   el.querySelectorAll('.decision').forEach(card=>{const id=card.dataset.id;const send=async(dec)=>{const btns=card.querySelectorAll('button');btns.forEach(b=>b.disabled=true);try{const r=await j(`${API}/decide`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({re:id,decision:dec,note:card.querySelector('[data-note]').value,priority:card.querySelector('[data-pri]').value})});toast(`${dec} 已送出 (${r.id}) from=${ME}`);await Promise.all([loadDecisions(),loadMessages()]);}catch(e){toast(e.message,true);btns.forEach(b=>b.disabled=false);}};card.querySelector('[data-go]').addEventListener('click',()=>send('GO'));card.querySelector('[data-nogo]').addEventListener('click',()=>send('NO-GO'));});
 }
-async function loadDecisions(){state.decisions=(await j(`${API}/decisions`)).requests;renderDecisions();}
+async function loadDecisions(){state.decisions=(await j(`${API}/decisions${pq()}`)).requests;renderDecisions();}
 
 function renderFleet(){
   const f=state.fleet;if(!f)return;const rows=f.rows||[];const problems=rows.filter(r=>r.verdict!=='ok').length;
@@ -310,11 +326,13 @@ function renderFleet(){
   $('fleet-when').textContent=(f.checked_at||'')+(f.server_error?' · '+f.server_error:'');
   const inbox=new Map((state.inbox?.handles||[]).map(h=>[h.handle,h]));
   const rem=f.remote||[];
-  $('remote-table').innerHTML=rem.length?`<tr><th>handle</th><th>last seen</th><th>from IP</th><th>hook state</th><th>unread</th><th>最舊未讀</th><th>open tasks</th></tr>`+rem.map(r=>`<tr><td><b>${esc(r.handle)}</b></td><td>${esc(r.last_seen_at||'never')}</td><td class="dim">${esc(r.last_seen_ip||'')}</td><td class="${r.presence_state==='busy'?'warn':r.presence_state==='idle'?'ok':'dim'}">${esc(r.presence_state||'—')}<div class="dim" style="font-size:10px">${esc(r.presence_at||'')}</div></td><td class="${r.unread_high_plus?'bad':r.unread?'warn':'ok'}">${r.unread}${r.unread_high_plus?' ('+r.unread_high_plus+'!)':''}</td><td>${r.oldest_unread_at?agoFromUtc(r.oldest_unread_at.slice(0,19)):''}</td><td>${r.open_tasks}</td></tr>`).join(''):`<tr><td class="dim">沒有遠端 handle</td></tr>`;
+  $('remote-table').innerHTML=rem.length?`<tr><th>handle</th><th>project</th><th>last seen</th><th>from IP</th><th>hook state</th><th>unread</th><th>最舊未讀</th><th>open tasks</th></tr>`+rem.map(r=>`<tr><td><b>${esc(r.handle)}</b></td><td class="${r.project?'':'dim'}">${esc(r.project||'—')}</td><td>${esc(r.last_seen_at||'never')}</td><td class="dim">${esc(r.last_seen_ip||'')}</td><td class="${r.presence_state==='busy'?'warn':r.presence_state==='idle'?'ok':'dim'}">${esc(r.presence_state||'—')}<div class="dim" style="font-size:10px">${esc(r.presence_at||'')}</div></td><td class="${r.unread_high_plus?'bad':r.unread?'warn':'ok'}">${r.unread}${r.unread_high_plus?' ('+r.unread_high_plus+'!)':''}</td><td>${r.oldest_unread_at?agoFromUtc(r.oldest_unread_at.slice(0,19)):''}</td><td>${r.open_tasks}</td></tr>`).join(''):`<tr><td class="dim">沒有遠端 handle</td></tr>`;
   const ret=f.retired||[];$('retired-count').textContent=ret.length;$('retired-list').textContent=ret.length?ret.join('  ·  '):'（無）';
-  $('fleet-table').innerHTML=`<tr><th>handle</th><th>pane</th><th>runtime</th><th>前景</th><th>watcher</th><th>Claude session</th><th>hook state</th><th>unread</th><th>最舊未讀</th><th>open / 未ack</th><th>verdict</th></tr>`+rows.map(r=>{const ib=inbox.get(r.handle)||{};return `<tr class="${r.verdict==='ok'?'':'problem'}"><td><b>${esc(r.handle)}</b></td><td>${esc(r.pane)}</td><td>${esc(r.runtime)}</td><td class="${r.match?'ok':'bad'}">${esc(r.pane_cmd)}</td><td class="${r.watcher==='online'?'ok':r.watcher==='none'?'dim':'bad'}">${esc(r.watcher)}${r.watcher_pane&&r.watcher_pane!==r.pane?' <span class="bad">('+esc(r.watcher_pane)+')</span>':''}</td><td>${esc(r.session||'')} <span class="${r.session_status==='busy'?'warn':r.session_status==='idle'?'ok':'dim'}">${esc(r.session_status||'')}</span></td><td class="${r.presence_state==='busy'?'warn':r.presence_state==='idle'?'ok':'dim'}">${esc(r.presence_state||'—')}<div class="dim" style="font-size:10px">${esc(r.presence_at||'')}</div></td><td class="${(ib.unread_high_plus)?'bad':ib.unread?'warn':'ok'}">${ib.unread??r.unread??0}${ib.unread_high_plus?' ('+ib.unread_high_plus+'!)':''}</td><td>${ib.oldest_unread_age_s!=null?ago(ib.oldest_unread_age_s):''}</td><td>${(ib.open_tasks||[]).length} / <span class="${(ib.unacked_tasks||[]).length?'warn':''}">${(ib.unacked_tasks||[]).length}</span></td><td class="${r.verdict==='ok'?'ok':'bad'}">${esc(r.verdict)}</td></tr>`;}).join('');
+  const projs=f.projects||[];
+  $('fleet-projects').innerHTML=projs.length?projs.map(p=>`<span class="tag ${PROJECT===p.name?'':'dim'}" title="${esc(p.coordination_dir||'')}">${esc(p.name)} · coord ${esc(p.coordinator||'?')}${p.coordinator_exists?'':' <span class="bad">(無帳號)</span>'} · ${p.handle_count} handles</span>`).join(' '):'<span class="dim">尚未定義專案（dispatch-fleet project add …）</span>';
+  $('fleet-table').innerHTML=`<tr><th>handle</th><th>project</th><th>pane</th><th>runtime</th><th>前景</th><th>watcher</th><th>Claude session</th><th>hook state</th><th>unread</th><th>最舊未讀</th><th>open / 未ack</th><th>verdict</th></tr>`+rows.map(r=>{const ib=inbox.get(r.handle)||{};return `<tr class="${r.verdict==='ok'?'':'problem'}"><td><b>${esc(r.handle)}</b></td><td class="${r.project?'':'bad'}">${esc(r.project||'—')}</td><td>${esc(r.pane)}</td><td>${esc(r.runtime)}</td><td class="${r.match?'ok':'bad'}">${esc(r.pane_cmd)}</td><td class="${r.watcher==='online'?'ok':r.watcher==='none'?'dim':'bad'}">${esc(r.watcher)}${r.watcher_pane&&r.watcher_pane!==r.pane?' <span class="bad">('+esc(r.watcher_pane)+')</span>':''}</td><td>${esc(r.session||'')} <span class="${r.session_status==='busy'?'warn':r.session_status==='idle'?'ok':'dim'}">${esc(r.session_status||'')}</span></td><td class="${r.presence_state==='busy'?'warn':r.presence_state==='idle'?'ok':'dim'}">${esc(r.presence_state||'—')}<div class="dim" style="font-size:10px">${esc(r.presence_at||'')}</div></td><td class="${(ib.unread_high_plus)?'bad':ib.unread?'warn':'ok'}">${ib.unread??r.unread??0}${ib.unread_high_plus?' ('+ib.unread_high_plus+'!)':''}</td><td>${ib.oldest_unread_age_s!=null?ago(ib.oldest_unread_age_s):''}</td><td>${(ib.open_tasks||[]).length} / <span class="${(ib.unacked_tasks||[]).length?'warn':''}">${(ib.unacked_tasks||[]).length}</span></td><td class="${r.verdict==='ok'?'ok':'bad'}">${esc(r.verdict)}</td></tr>`;}).join('');
 }
-async function loadFleet(){state.fleet=await j(`${API}/fleet`);renderFleet();}
+async function loadFleet(){state.fleet=await j(`${API}/fleet${pq()}`);renderFleet();}
 
 function populateHandles(){
   const hs=(state.inbox?.handles||[]);HANDLES=hs.map(h=>h.handle);
@@ -327,14 +345,14 @@ function showTab(name){document.querySelectorAll('.tab').forEach(t=>t.classList.
 document.querySelectorAll('.tab').forEach(t=>t.addEventListener('click',()=>showTab(t.dataset.tab)));
 
 async function refreshAll(){
-  try{await loadInbox();populateHandles();await Promise.all([loadMessages(),loadTasks(),loadDecisions()]);if($('panel-fleet').classList.contains('active'))await loadFleet();}catch(e){if(e.message!=='401')console.error(e);}
+  try{await loadProjects();await loadInbox();populateHandles();await Promise.all([loadMessages(),loadTasks(),loadDecisions()]);if($('panel-fleet').classList.contains('active'))await loadFleet();}catch(e){if(e.message!=='401')console.error(e);}
 }
 ['f-from','f-to','f-type','f-priority','f-status','f-since'].forEach(id=>$(id).addEventListener('change',()=>loadMessages().catch(e=>toast(e.message,true))));
 let qTimer;$('f-q').addEventListener('input',()=>{clearTimeout(qTimer);qTimer=setTimeout(()=>loadMessages().catch(e=>toast(e.message,true)),300);});
 $('f-clear').addEventListener('click',()=>{['f-from','f-to','f-type','f-priority','f-status'].forEach(id=>$(id).value='');$('f-q').value='';$('f-since').value='today';loadMessages();});
 $('c-send').addEventListener('click',async()=>{const body=$('c-body').value.trim();if(!body)return;const payload={to:$('c-to').value==='all'?null:$('c-to').value,type:$('c-type').value,priority:$('c-priority').value,body};if(replyTo)payload.re=replyTo;try{const r=await j(`${API}/send`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(payload)});toast(`已送出 ${r.id}${r.task_id?' · '+r.task_id:''}`);$('c-body').value='';replyTo=null;$('c-body').placeholder='以登入帳號送訊息（--re 用右側 thread 的「回覆」）';await loadMessages();}catch(e){toast(e.message,true);}});
 $('s-save').addEventListener('click',async()=>{try{const r=await j(`${API}/settings`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({task_stale_hours:$('s-hours').value,task_max_continuing:$('s-cont').value})});$('s-msg').textContent=`已儲存 ${r.task_stale_hours}h / ${r.task_max_continuing}×`;await loadTasks();}catch(e){toast(e.message,true);}});
-$('mirror-all').addEventListener('click',async()=>{try{const r=await j(`${API}/tasks/mirror-all`,{method:'POST'});toast(`已重寫 ${r.mirrored} 個鏡像檔 → ${r.tasks_dir}`);}catch(e){toast(e.message,true);}});
+$('mirror-all').addEventListener('click',async()=>{try{const r=await j(`${API}/tasks/mirror-all${pq()}`,{method:'POST'});toast(`已重寫 ${r.mirrored} 個鏡像檔 → ${(r.tasks_dirs||[r.tasks_dir]).join(', ')}`);}catch(e){toast(e.message,true);}});
 
 // ── live updates over SSE (falls back to the 10 s poll) ──
 function connectEvents(){
@@ -356,6 +374,7 @@ overlay.addEventListener('click',e=>{if(e.target===overlay)closePwModal();});doc
 function showPwMsg(text,type){pwMsg.textContent=text;pwMsg.className='modal-msg '+type;}
 pwForm.addEventListener('submit',async e=>{e.preventDefault();pwMsg.className='modal-msg';pwMsg.textContent='';if(newPw.value!==newPw2.value){showPwMsg('新密碼不一致','error');newPw2.focus();return;}if(newPw.value.length<8){showPwMsg('新密碼至少需 8 個字元','error');return;}if(newPw.value===curPw.value){showPwMsg('新密碼必須與目前密碼不同','error');return;}savePw.disabled=true;savePw.textContent='儲存中…';try{const res=await fetch(API+'/change-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({current_password:curPw.value,new_password:newPw.value})});const body=await res.json().catch(()=>({}));if(!res.ok)throw new Error(body.error||`HTTP ${res.status}`);showPwMsg('密碼已更新','success');setTimeout(closePwModal,1200);}catch(err){showPwMsg(err.message||'無法變更密碼','error');savePw.disabled=false;savePw.textContent='儲存';}});
 
+document.title=`dispatch — ${PROJECT==='all'?'指揮面板':PROJECT}`;
 loadSession().then(refreshAll);
 connectEvents();
 setInterval(refreshAll,10000);

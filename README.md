@@ -46,7 +46,7 @@ curl -s -H "Authorization: Bearer $TOK" -H 'content-type: application/json' \
 
 | field | values | notes |
 |---|---|---|
-| `to` | handle, `"all"`, or omitted | omitted/`all` = broadcast; unknown handle → 404 with the known list |
+| `to` | handle, `"all"`, `"coord"`, or omitted | omitted/`all` = broadcast; unknown handle → 404 with the known list; `coord` = the sender's project coordinator (see Projects) — the response then carries `alias:"coord"` and `resolved_to` |
 | `body` | string ≤ 1,500 chars | required; over the limit → 400 `{error, limit, chars}` |
 | `type` | `task` `question` `request_permission` `report` `ack` `info` | default `info` |
 | `priority` | `low` `medium` `high` `immediate` | default `medium`; legacy `normal`→`medium`, `urgent`→`immediate` |
@@ -57,6 +57,7 @@ curl -s -H "Authorization: Bearer $TOK" -H 'content-type: application/json' \
 | `attachments` | `["/abs/path", …]` or `[{path,size,sha256,name}, …]` | paths only, nothing is uploaded |
 | `force` | boolean | only with `priority=immediate`; makes the recipient's hook deny its next tool call once |
 | `title` | string ≤ 120 | `type=task` only; the task title (fallback: first body line minus a leading `[TAG]`, 80 chars) |
+| `project` | project name | files a `type=task` under that project (default: the sender's project, else the recipient's); unknown → 404 |
 
 Effects: `type=task` creates a task (title = first non-empty line, ≤ 80 chars; `documents` = attachments; `thread_id` = message id). `type=ack` sets the referenced message `acked` and its task `acked`. `type=report` applies `state` to the task resolved from `task_id` → `re` (task id) → `re` (message with `task_id`) — a report that names no task touches none (no "single open task" fallback; it only counts as "reported this turn"); `done` closes it with the body as `result`; a referenced message becomes `closed` (done) or `answered`. Any non-ack, non-report reply to a `question`/`request_permission` marks it `answered`. Acking a `report` (or an `ack`) is refused with 400.
 
@@ -102,6 +103,10 @@ curl -s -H "Authorization: Bearer $TOK" -H 'content-type: application/json' \
 
 Per registered handle: `last_seen_at`, `mcp_connected`, hook-reported `state`/`state_at`/`session`, `unread`, `unread_high_plus`, `oldest_unread_at`, `open_tasks`, `unacked_tasks`. Any valid token may call it.
 
+### `GET /projects`
+
+The project registry as the server sees it: `projects[]` (`name, coordination_dir, tmux_session, coordinator, handles[], handle_count, coordinator_exists, tasks_dir`), `unassigned[]` (handles with no project) and `default_tasks_dir`. `/fleet` rows carry `project` too. `dispatch-fleet check` compares both with `fleet.json`.
+
 ### `GET /events`
 
 SSE feed of `task_*` and `message_created` events, filtered to the caller (directed or broadcast, never your own). The watcher subscribes here.
@@ -111,9 +116,11 @@ SSE feed of `task_*` and `message_created` events, filtered to the caller (direc
 Python 3 stdlib only (they also run inside hooks on a 2 s budget). `dispatchlib.py` is shared.
 
 ```
-dispatch-send <to|all> [--type T] [--title "<task title>"] [--priority P]
+dispatch-send <to|all|coord> [--type T] [--title "<task title>"] [--priority P]
               [--ack yes|no|auto] [--re <id>] [--task <T-id>] [--state S]
-              [--attach <path>]... [--force] [--json] "<body>"
+              [--project <name>] [--attach <path>]... [--force] [--json] "<body>"
+    <to> = handle, "all", or "coord" = YOUR project's coordinator (server-resolved; prints
+    "sent -> coord-byreal (alias coord)"). --project files a type=task under another project.
     --title (type=task, recommended): stored as tasks.title and used for the mirror filename
     slug (Unicode letters kept, so a Chinese title stays readable). Without it: first body
     line minus a leading [TAG], cut to 80 chars.
@@ -132,14 +139,27 @@ dispatch-recv [--limit N] [--priority high+] [--all] [--since <id>]
 
 dispatch-fleet check [--json] | sync [--write] [--prune] | remove <handle> [--watcher]
                | watchers [--restart] [--only <handle>] | show
-    check: per handle — pane, runtime, pane_current_command vs expected (claude→claude, codex→node),
-    watcher pm2 status + pane drift, Claude session name/status, server state/unread/open tasks;
-    exit 1 on any problem. sync: refresh fleet.json; --prune retires handles with no pane AND no
-    watcher; --write also regenerates registry.json. remove: retire a handle from fleet.json and
-    registry.json (kept in fleet.json "retired" so sync never resurrects it); --watcher also
-    pm2-deletes watch-<handle>. watchers: start (or --restart) one pm2 watch-<handle> per fleet.json
-    entry with env derived from fleet.json — this replaced the hand-maintained watchers.<host>.cjs
-    ecosystem file, which is deprecated (deploy-fleet.mjs no longer writes it).
+dispatch-fleet project add <name> [--dir <coordination_dir>] [--session <tmux>] [--coordinator <handle>]
+dispatch-fleet project list [--json] | project remove <name> [--force] | project assign <name> <handle>...
+dispatch-fleet add <handle> --project <p> --cwd <dir> [--runtime claude|codex] [--session <tmux>]
+               [--window <name>] [--pane <%id>] [--cmd "<launch cmd>"] [--no-watcher] [--no-wait] [--timeout <s>]
+    check: per handle — project, pane, runtime, pane_current_command vs expected (claude→claude,
+    codex→node), watcher pm2 status + pane drift, Claude session name/status, server state/unread/
+    open tasks, project present on both sides; per project — fleet.json = server, coordinator has
+    an account; plus ~/.dispatch vs cli/ drift. exit 1 on any problem. sync: refresh fleet.json
+    (projects and per-handle project survive); --prune retires handles with no pane AND no watcher;
+    --write also regenerates registry.json. remove: retire a handle from fleet.json and registry.json
+    (kept in fleet.json "retired" so sync never resurrects it) and clear its server-side project;
+    --watcher also pm2-deletes watch-<handle>. watchers: start (or --restart) one pm2 watch-<handle>
+    per fleet.json entry with env derived from fleet.json (watchers.<host>.cjs is deprecated).
+    project add/remove/assign: write fleet.json AND the server (via node src/admin.js). Defaults:
+    --session <name>, --coordinator coord-<name>. remove refuses while handles are still assigned.
+    add: onboard one agent — new tmux window in the project's session (or --pane to register an
+    existing one; cwd defaults to the pane's), server account (reused if it exists), fleet.json +
+    registry.json entry, launch the runtime, wait for the Claude prompt (the folder-trust dialog
+    defaults to "No, exit" in 2.1.259 — the cursor is moved to the affirmative option before
+    Enter; never blind Enter), record the Claude session, start watch-<handle>. Re-runnable: an
+    already-registered live pane is reused and driven to the prompt again.
 ```
 
 ### `~/.dispatch/fleet.json`
@@ -150,15 +170,41 @@ dispatch-fleet check [--json] | sync [--write] [--prune] | remove <handle> [--wa
   "generated_at": "2026-09-03 13:25:10+0800",
   "url": "http://127.0.0.1:7900",
   "tmux_tmpdir": "/var/solana/data/tmp",
+  "projects": {
+    "pearl":    { "coordination_dir": "/var/solana/data/pearl_workspace/coordination", "tmux_session": "pearl", "coordinator": "coord" },
+    "dispatch": { "coordination_dir": "/var/solana/data/pearl_workspace/coordination", "tmux_session": "pearl", "coordinator": "coord" }
+  },
   "handles": {
-    "coord": { "token": "coord-…", "runtime": "claude", "pane": "%0",
+    "coord": { "token": "coord-…", "runtime": "claude", "pane": "%0", "project": "pearl",
                "watcher": "watch-coord", "watcher_pane": "%0",
                "session_name": "coordination-6d", "cwd": "/…/coordination", "session_id": "…" }
-  }
+  },
+  "retired": ["dtest", "…"]
 }
 ```
 
-Single source of truth for handle → token / runtime / pane / session_name / cwd / watcher. `registry.json` (pane → handle/token/runtime) is kept as a derived file for `dispatch-common.sh` and the watcher's expected-command lookup. `session_name` is whatever `~/.claude/sessions/<pid>.json` reported at sync time — it changes on every session restart, so treat it as a cache.
+Single source of truth on this host for handle → token / runtime / pane / project / session_name / cwd / watcher, and for the `projects` registry. `registry.json` (pane → handle/token/runtime) is kept as a derived file for `dispatch-common.sh` and the watcher's expected-command lookup. `session_name` is whatever `~/.claude/sessions/<pid>.json` reported at sync time — it changes on every session restart, so treat it as a cache.
+
+## Projects (multi-project, T-20260903-20)
+
+One server, one DB, one dashboard serve several projects on the host. A **project** = a coordinator session, its agents and a `coordination/` directory. Handles stay globally unique; each belongs to at most one project (`user`, the human decision account, belongs to none).
+
+- **Registry.** `fleet.json` has `projects.<name> = {coordination_dir, tmux_session, coordinator}` and every handle carries `project`. The server keeps the same data in its DB (`projects` table, `users.project`) — that is the truth for remote (i5) handles too — and `dispatch-fleet project …` / `dispatch-fleet add` write both. `dispatch-fleet check` flags any disagreement.
+- **`coord` alias.** `dispatch-send coord …` (the global CLAUDE.md standing rule) is resolved *by the server* to the sender's project coordinator. Pearl's coordinator is the literal handle `coord`, so Pearl agents, `user`, and handles without a project are unchanged. A project whose coordinator has no account gets a 404 instead of a misrouted message.
+- **Tasks.** A `type=task` message is filed under the sender's project (override with `--project`, fallback: the recipient's). Its markdown mirror goes to `<coordination_dir>/tasks/` of that project; Pearl's path and file format are byte-for-byte what they were (no new frontmatter key). A project without `coordination_dir`, or a task without a project, uses `DISPATCH_TASKS_DIR`.
+- **Dashboard.** The header has a project switcher (all / one project) that scopes inbox strip, filters, composer, task board (tasks of the project + tasks assigned to its agents), decisions and the Fleet tab; the choice is remembered per browser (`localStorage`). `/api/inbox|messages|tasks|decisions|fleet|tasks/mirror-all` accept `?project=`.
+- **Platform project.** `dispatch-dev` is in project `dispatch`, coordinated by Pearl's `coord` (same coordination dir), so every coordinator can address it and its reports still go to `coord`. Everything else on this host and on i5 is `pearl`.
+
+Onboarding a project (the runbook `docs/runbooks/onboard-new-project.md` wraps this):
+
+```
+dispatch-fleet project add byreal --dir /var/solana/data/byreal/coordination --session byreal --coordinator coord-byreal
+dispatch-fleet add coord-byreal --project byreal --cwd /var/solana/data/byreal/coordination --runtime claude
+dispatch-fleet add byreal-dev   --project byreal --pane %12 --runtime claude      # existing pane; cwd = the pane's
+dispatch-fleet check                                                              # 0 problems
+```
+
+Offboarding: `dispatch-fleet remove <handle> --watcher` for each handle (clears its server-side project), then `dispatch-fleet project remove <name>`.
 
 ## Claude Code hooks (`cli/hook.sh` → `dispatch-hook.py`)
 
@@ -181,7 +227,9 @@ Every server call has a ≤ 2 s timeout; if the server is unreachable the hook e
 
 `message_reads`: `(handle, message_id, read_at)` — the per-recipient read set. Unread = addressed to me or broadcast, not from me, `created_at >= users.last_message_seen_at`, and not in my read set. The cursor is a lower bound so the read set stays small; it only advances when a drain returned everything.
 
-`tasks`: the original columns plus `ack_required, acked_at, documents (JSON), thread_id`; `status` gains `acked | waiting | blocked`; `claim_task` accepts `open` or `acked`.
+`tasks`: the original columns plus `ack_required, acked_at, documents (JSON), thread_id, project`; `status` gains `acked | waiting | blocked`; `claim_task` accepts `open` or `acked`.
+
+`projects`: `name, coordination_dir, tmux_session, coordinator, created_at, updated_at`; `users.project` links a handle to one. Tasks with `project IS NULL` are backfilled from their creator's (else assignee's) project at boot and whenever a handle is assigned.
 
 `presence`: plus `state, state_at, session`.
 

@@ -1,7 +1,24 @@
 #!/usr/bin/env python3
 """Fleet registry + health check.
 
-usage: dispatch-fleet check [--json]        audit every handle (tmux pane, watcher, Claude session, server inbox)
+usage: dispatch-fleet check [--json]        audit every handle (tmux pane, watcher, Claude session, server inbox,
+                                       project) and every project (coordinator account, fleet.json = server)
+       dispatch-fleet project add <name> [--dir <coordination_dir>] [--session <tmux>] [--coordinator <handle>]
+       dispatch-fleet project list [--json]
+       dispatch-fleet project remove <name> [--force]
+       dispatch-fleet project assign <name> <handle>...
+                                       projects = the multi-project namespace (one server, several
+                                       coordinators). add/remove/assign write fleet.json AND the server
+                                       (node src/admin.js). Defaults: --session <name>, --coordinator
+                                       coord-<name>. remove refuses while handles are still assigned.
+       dispatch-fleet add <handle> --project <p> --cwd <dir> [--runtime claude|codex] [--session <tmux>]
+                                   [--window <name>] [--pane <%id>] [--cmd "<launch cmd>"] [--no-watcher]
+                                   [--no-wait] [--timeout <s>]
+                                       onboard one agent: create a tmux window in the project's session
+                                       (or register an existing --pane), launch the runtime, create the
+                                       server account (reused if it exists), register pane + token +
+                                       project in fleet.json/registry.json, wait for the Claude prompt
+                                       (trust dialog auto-accepted), start watch-<handle>. Re-runnable.
        dispatch-fleet sync [--write] [--prune]
                                        refresh fleet.json from registry.json + pm2 + ~/.claude/sessions.
                                        --prune drops handles whose pane is gone AND that have no pm2 watcher
@@ -22,6 +39,8 @@ watcher's expected-command lookup.
 """
 import json
 import os
+import re
+import shlex
 import subprocess
 import sys
 import time
@@ -32,6 +51,77 @@ import dispatchlib as D  # noqa: E402
 RUNTIME_CMD = {"claude": "claude", "codex": "node"}
 FLEET_PATH = os.path.join(D.CFG, "fleet.json")
 REG_PATH = os.path.join(D.CFG, "registry.json")
+PROJECT_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")
+HANDLE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+DEFAULT_REPO = "/var/solana/data/dispatch-mcp"
+
+
+def repo_path(fleet=None):
+    fleet = fleet if fleet is not None else (D.load_fleet() or {})
+    return fleet.get("repo") or os.environ.get("DISPATCH_REPO") or DEFAULT_REPO
+
+
+def admin(args, timeout=30, must=True):
+    """node <repo>/src/admin.js <args> --json -> parsed JSON. Dies on failure (the
+    server's DB is the truth for accounts + projects; fleet.json mirrors it);
+    must=False returns None instead."""
+    repo = repo_path()
+    script = os.path.join(repo, "src", "admin.js")
+    if not os.path.exists(script):
+        D.die("no %s (repo path: set fleet.json \"repo\" or $DISPATCH_REPO)" % script)
+    try:
+        r = subprocess.run(["node", script] + list(args) + ["--json"], capture_output=True, text=True,
+                           timeout=timeout, cwd=repo)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        D.die("admin.js %s: %s" % (" ".join(args), e))
+    if r.returncode != 0:
+        if not must:
+            return None
+        D.die("admin.js %s failed: %s" % (" ".join(args), (r.stderr.strip() or r.stdout.strip() or "exit %d" % r.returncode)))
+    for line in reversed([l for l in r.stdout.splitlines() if l.strip()]):
+        try:
+            return json.loads(line)
+        except ValueError:
+            continue
+    return {}
+
+
+def ensure_tmux_env():
+    """pm2 / cron callers have no TMUX_TMPDIR; take it from fleet.json."""
+    if not os.environ.get("TMUX_TMPDIR"):
+        f = D.load_fleet() or {}
+        os.environ["TMUX_TMPDIR"] = f.get("tmux_tmpdir") or "/var/solana/data/tmp"
+
+
+def parse_args(args, value_flags=(), bool_flags=()):
+    opts, pos = {}, []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a.startswith("--") and "=" in a and a.split("=", 1)[0] in value_flags:
+            k, v = a.split("=", 1)
+            opts[k[2:]] = v
+            i += 1
+            continue
+        if a in value_flags:
+            if i + 1 >= len(args):
+                D.die("dispatch-fleet: %s needs a value" % a, 2)
+            opts[a[2:]] = args[i + 1]
+            i += 2
+            continue
+        if a in bool_flags:
+            opts[a[2:].replace("-", "_")] = True
+            i += 1
+            continue
+        if a.startswith("-"):
+            D.die("dispatch-fleet: unknown flag %s" % a, 2)
+        pos.append(a)
+        i += 1
+    return opts, pos
+
+
+def touch(fleet):
+    fleet["generated_at"] = time.strftime("%Y-%m-%d %H:%M:%S%z")
 
 
 def sh(args, timeout=5):
@@ -118,14 +208,18 @@ def build_fleet(prune=False):
                 pruned.append(h)
                 del handles[h]
                 retired.add(h)
-    return {
+    out = {
         "version": 1,
         "generated_at": time.strftime("%Y-%m-%d %H:%M:%S%z"),
         "url": old.get("url") or D.server_url(),
         "tmux_tmpdir": old.get("tmux_tmpdir") or os.environ.get("TMUX_TMPDIR") or "/var/solana/data/tmp",
+        "projects": old.get("projects") or {},
         "handles": dict(sorted(handles.items())),
         "retired": sorted(retired),
-    }, pruned
+    }
+    if old.get("repo"):
+        out["repo"] = old["repo"]
+    return out, pruned
 
 
 def write_fleet(fleet):
@@ -137,11 +231,13 @@ def write_fleet(fleet):
     os.replace(tmp, FLEET_PATH)
 
 
-def write_registry_from(fleet):
+def write_registry_from(fleet, quiet=False):
     reg = {}
     for h, ent in fleet["handles"].items():
         if ent.get("pane") and ent.get("token"):
             reg[ent["pane"]] = {"handle": h, "token": ent["token"], "runtime": ent.get("runtime", "claude")}
+    if quiet and D.load_registry() == reg:
+        return
     if os.path.exists(REG_PATH):
         bak = REG_PATH + ".bak-fleet-%d" % int(time.time())
         os.replace(REG_PATH, bak)
@@ -187,6 +283,11 @@ def cmd_remove(handle, watcher):
             json.dump(reg, f, indent=2)
             f.write("\n")
         print("registry.json: dropped pane(s) %s (backup %s)" % (", ".join(dropped), bak))
+    # a retired handle belongs to no project any more (so `project remove` can
+    # succeed once every handle is retired); the account + history stay
+    if ent and ent.get("project"):
+        if admin(["set-project", handle, "-"], must=False) is not None:
+            print("server: %s cleared from project %s" % (handle, ent["project"]))
     if watcher:
         rc, out = sh(["pm2", "delete", "watch-" + handle], timeout=20)
         print("pm2 delete watch-%s: %s" % (handle, "ok" if rc == 0 else "failed/not found"))
@@ -196,6 +297,318 @@ def cmd_remove(handle, watcher):
             print("note: pm2 watcher %s still exists — rerun with --watcher or: pm2 delete %s" % (w["name"], w["name"]))
     print("note: the server user is untouched; to delete it: node src/admin.js remove %s" % handle)
     return 0
+
+
+def local_handles_in(fleet, name):
+    return sorted(h for h, e in (fleet.get("handles") or {}).items() if e.get("project") == name)
+
+
+def cmd_project(args):
+    opts, pos = parse_args(args, ("--dir", "--session", "--coordinator"), ("--force", "--json"))
+    sub = pos[0] if pos else ""
+    fleet = D.load_fleet()
+    if not fleet:
+        D.die("no fleet.json at %s — run: dispatch-fleet sync" % FLEET_PATH)
+    projects = fleet.setdefault("projects", {})
+    if sub == "add":
+        if len(pos) != 2 or not PROJECT_RE.match(pos[1]):
+            D.die("usage: dispatch-fleet project add <name> [--dir <coordination_dir>] [--session <tmux>] [--coordinator <handle>]\n"
+                  "       name: [a-z0-9][a-z0-9_-]*, ≤ 40 chars", 2)
+        name = pos[1]
+        ent = dict(projects.get(name) or {})
+        if opts.get("dir"):
+            ent["coordination_dir"] = os.path.abspath(os.path.expanduser(opts["dir"]))
+        if opts.get("session"):
+            ent["tmux_session"] = opts["session"]
+        if opts.get("coordinator"):
+            ent["coordinator"] = opts["coordinator"]
+        ent.setdefault("tmux_session", name)          # D9: tmux session = project name
+        ent.setdefault("coordinator", "coord-" + name)  # D9: coordinator handle = coord-<project>
+        projects[name] = ent
+        touch(fleet)
+        write_fleet(fleet)
+        aargs = ["project", "add", name]
+        for key, flag in (("coordination_dir", "--dir"), ("tmux_session", "--session"), ("coordinator", "--coordinator")):
+            if ent.get(key):
+                aargs += [flag, ent[key]]
+        admin(aargs)
+        print("project %s: coordinator=%s session=%s dir=%s  (fleet.json + server)" % (
+            name, ent["coordinator"], ent["tmux_session"], ent.get("coordination_dir") or "-"))
+        if not ent.get("coordination_dir"):
+            print("note: no --dir — tasks filed under %s mirror to the server's default tasks dir; add one with: dispatch-fleet project add %s --dir <coordination_dir>" % (name, name))
+        if ent.get("coordination_dir") and not os.path.isdir(os.path.join(ent["coordination_dir"], "tasks")):
+            print("note: %s/tasks does not exist yet (created on first task)" % ent["coordination_dir"])
+        sp = {p["name"]: p for p in admin(["project", "list"]).get("projects", [])}
+        if not sp.get(name, {}).get("coordinator_exists"):
+            print("note: coordinator %s has no server account yet — next: dispatch-fleet add %s --project %s --cwd %s --runtime claude" % (
+                ent["coordinator"], ent["coordinator"], name, ent.get("coordination_dir") or "<dir>"))
+        return 0
+    if sub == "list":
+        server = admin(["project", "list"])
+        sp = {p["name"]: p for p in server.get("projects", [])}
+        names = sorted(set(projects) | set(sp))
+        if opts.get("json"):
+            print(json.dumps({"fleet": projects, "server": server}, ensure_ascii=False, indent=2))
+            return 0
+        if not names:
+            print("no projects. add one: dispatch-fleet project add <name> --dir <coordination_dir> --session <tmux> --coordinator <handle>")
+            return 0
+        cols = [("project", 12), ("coordinator", 14), ("local", 5), ("server", 6), ("tmux", 12), ("coordination_dir", 48), ("verdict", 0)]
+        hdr = "  ".join((c if w == 0 else c.ljust(w)) for c, w in cols)
+        print(hdr)
+        print("-" * len(hdr))
+        problems = 0
+        for n in names:
+            f = projects.get(n)
+            sv = sp.get(n)
+            local = local_handles_in(fleet, n)
+            verdict = []
+            if not f:
+                verdict.append("NOT IN fleet.json")
+            if not sv:
+                verdict.append("NOT ON SERVER")
+            if f and sv:
+                for key in ("coordinator", "tmux_session", "coordination_dir"):
+                    if (f.get(key) or None) != (sv.get(key) or None):
+                        verdict.append("%s differs (server: %s)" % (key, sv.get(key) or "-"))
+                if not sv.get("coordinator_exists"):
+                    verdict.append("coordinator has no account")
+            if verdict:
+                problems += 1
+            src = f or sv or {}
+            row = [n, src.get("coordinator") or "-", str(len(local)), str(sv["handle_count"]) if sv else "-",
+                   src.get("tmux_session") or "-", src.get("coordination_dir") or "-", "; ".join(verdict) or "ok"]
+            print("  ".join((v if w == 0 else v.ljust(w)[:w]) for v, (c, w) in zip(row, cols)).rstrip())
+        print("")
+        un_local = sorted(h for h, e in fleet["handles"].items() if not e.get("project"))
+        if un_local:
+            print("local handles without project: %s   (dispatch-fleet project assign <name> %s)" % (", ".join(un_local), " ".join(un_local)))
+        if server.get("unassigned"):
+            print("server handles without project: %s" % ", ".join(server["unassigned"]))
+        print("%d project(s), %d problem(s)." % (len(names), problems))
+        return 1 if problems else 0
+    if sub == "remove":
+        if len(pos) != 2:
+            D.die("usage: dispatch-fleet project remove <name> [--force]", 2)
+        name = pos[1]
+        local = local_handles_in(fleet, name)
+        if local and not opts.get("force"):
+            D.die("refusing: %d local handle(s) still in project %s: %s\n"
+                  "  retire them first (dispatch-fleet remove <handle> --watcher) or reassign (dispatch-fleet project assign <other> ...),\n"
+                  "  or --force to clear their project field" % (len(local), name, ", ".join(local)))
+        sp = {p["name"]: p for p in admin(["project", "list"]).get("projects", [])}
+        if name in sp:
+            admin(["project", "remove", name] + (["--force"] if opts.get("force") else []))
+        for h in local:
+            fleet["handles"][h].pop("project", None)
+        was = projects.pop(name, None)
+        touch(fleet)
+        write_fleet(fleet)
+        print("project %s removed from %s%s" % (name, "fleet.json" if was else "(not in fleet.json)", " + server" if name in sp else ""))
+        if local:
+            print("cleared project on: %s" % ", ".join(local))
+        return 0
+    if sub == "assign":
+        if len(pos) < 3:
+            D.die("usage: dispatch-fleet project assign <name> <handle>...", 2)
+        name = pos[1]
+        if name not in projects:
+            D.die("unknown project %s — run: dispatch-fleet project add %s ..." % (name, name))
+        for h in pos[2:]:
+            admin(["set-project", h, name])
+            if h in fleet["handles"]:
+                fleet["handles"][h]["project"] = name
+                print("%s -> %s  (fleet.json + server)" % (h, name))
+            else:
+                print("%s -> %s  (server only: not in this host's fleet.json)" % (h, name))
+        touch(fleet)
+        write_fleet(fleet)
+        return 0
+    D.die("usage: dispatch-fleet project add|list|remove|assign ...", 2)
+
+
+CURSOR_RE = re.compile(r"^\s*❯\s*(\S.*)$", re.M)   # menu cursor on an option ("❯ No, exit", "❯ 1. Yes, proceed")
+PROMPT_RE = re.compile(r"^\s*❯\s*$", re.M)           # the empty composer line = idle prompt
+AFFIRM_RE = re.compile(r"^(\d+\.\s*)?(yes|ok|continue|accept|proceed|i trust)", re.I)
+
+
+def wait_for_claude(pane, timeout):
+    """Poll the pane until Claude Code shows its idle prompt. Menu dialogs on the
+    way — the workspace-trust check ("❯ No, exit / Yes, I trust this folder",
+    default is NO in 2.1.259), the bypass-permissions confirmation, release
+    notes — are answered by moving the cursor to the affirmative option and
+    pressing Enter. Never presses Enter on a non-affirmative option."""
+    t0 = time.time()
+    notes = []
+    last_key = 0.0
+    nudges = 0
+    while time.time() - t0 < timeout:
+        rc, out = sh(["tmux", "capture-pane", "-p", "-t", pane])
+        if rc == 0:
+            cur = CURSOR_RE.search(out)
+            # a menu = cursor on option TEXT (letters, not a box-drawing rule the
+            # composer draws under "❯") and a dialog hint somewhere on screen
+            menu_hint = re.search(r"enter to confirm|esc to cancel|^\s*\d+\.\s", out, re.I | re.M)
+            if cur and not (re.search(r"[A-Za-z]", cur.group(1)) and menu_hint):
+                cur = None
+            if PROMPT_RE.search(out) and not cur:
+                return True, "; ".join(notes) or "prompt ready in %ds" % int(time.time() - t0)
+            press = re.search(r"press enter to continue", out, re.I)
+            if (cur or press) and time.time() - last_key > 1.5:
+                text = cur.group(1).strip() if cur else ""
+                if press or AFFIRM_RE.match(text):
+                    sh(["tmux", "send-keys", "-t", pane, "Enter"])
+                    notes.append("dialog: accepted '%s'" % (text or "Enter")[:50])
+                    nudges = 0
+                else:
+                    if nudges >= 8:
+                        return False, "menu with no affirmative option (cursor on '%s') — answer it in the pane and rerun" % text[:50]
+                    sh(["tmux", "send-keys", "-t", pane, "Down" if nudges < 4 else "Up"])
+                    nudges += 1
+                last_key = time.time()
+        time.sleep(1)
+    return False, "no prompt after %ds (last screen kept in the pane; check it and rerun)" % timeout
+
+
+def wait_for_cmd(pane, expect, timeout):
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        p = tmux_panes().get(pane)
+        if p and not p["dead"] and p["cmd"] == expect:
+            return True, "%s is running" % expect
+        time.sleep(1)
+    return False, "pane foreground never became %s within %ds" % (expect, timeout)
+
+
+def cmd_add(args):
+    opts, pos = parse_args(args, ("--project", "--cwd", "--runtime", "--session", "--window", "--pane", "--cmd", "--timeout"),
+                           ("--no-watcher", "--no-wait", "--json"))
+    if len(pos) != 1:
+        D.die("usage: dispatch-fleet add <handle> --project <p> --cwd <dir> [--runtime claude|codex] [--session <tmux>] "
+              "[--window <name>] [--pane <%id>] [--cmd <launch cmd>] [--no-watcher] [--no-wait] [--timeout <s>]", 2)
+    handle = pos[0]
+    if not HANDLE_RE.match(handle) or handle in ("all", "coord-"):
+        D.die("bad handle %r ([A-Za-z0-9][A-Za-z0-9_.-]*, not 'all')" % handle, 2)
+    fleet = D.load_fleet()
+    if not fleet:
+        D.die("no fleet.json at %s — run: dispatch-fleet sync" % FLEET_PATH)
+    projects = fleet.get("projects") or {}
+    project = opts.get("project")
+    if not project:
+        D.die("dispatch-fleet add: --project <name> is required (projects: %s)" % (", ".join(sorted(projects)) or "none"), 2)
+    if project not in projects:
+        D.die("unknown project %s — first: dispatch-fleet project add %s --dir <coordination_dir> --session <tmux> --coordinator <handle>" % (project, project))
+    runtime = opts.get("runtime") or "claude"
+    if runtime not in RUNTIME_CMD:
+        D.die("--runtime must be claude|codex", 2)
+    expect = RUNTIME_CMD[runtime]
+    panes = tmux_panes()
+    handles = fleet.setdefault("handles", {})
+    existing = handles.get(handle)
+    pane = opts.get("pane")
+    if existing:
+        cur = panes.get(existing.get("pane"))
+        if cur and not cur["dead"] and (not pane or pane == existing.get("pane")):
+            # re-run: keep the pane, re-check account/project, drive any pending
+            # dialog to the prompt, make sure the watcher is up
+            pane = existing["pane"]
+            print("%s is already registered on pane %s (%s) — reusing it" % (handle, pane, cur["cmd"]))
+        elif pane and existing.get("pane") != pane:
+            D.die("%s is already registered on pane %s — dispatch-fleet remove %s first" % (handle, existing.get("pane"), handle))
+        else:
+            print("note: %s was registered on pane %s, which is gone — re-creating" % (handle, existing.get("pane")))
+            existing = None
+    if handle in (fleet.get("retired") or []):
+        print("note: %s is in the retired list — reviving it" % handle)
+    session = opts.get("session") or projects[project].get("tmux_session") or project
+    window = opts.get("window") or handle
+    cwd = opts.get("cwd")
+    if pane:
+        if pane not in panes:
+            D.die("pane %s not found (tmux list-panes -a)" % pane)
+        if panes[pane]["dead"]:
+            D.die("pane %s is dead (exit %s) — respawn or pick another" % (pane, panes[pane].get("dead_status")))
+        if not cwd:
+            _, cwd = sh(["tmux", "display", "-p", "-t", pane, "#{pane_current_path}"])
+            cwd = cwd.strip()
+    if not cwd:
+        D.die("dispatch-fleet add: --cwd <dir> is required (the agent's working directory)", 2)
+    cwd = os.path.abspath(os.path.expanduser(cwd))
+    if not os.path.isdir(cwd):
+        D.die("--cwd %s is not a directory" % cwd)
+    created = None
+    if not pane:
+        rc, _ = sh(["tmux", "has-session", "-t", "=" + session])
+        if rc != 0:
+            rc, out = sh(["tmux", "new-session", "-d", "-s", session, "-n", window, "-c", cwd, "-P", "-F", "#{pane_id}"])
+            created = "session %s" % session
+        else:
+            rc, out = sh(["tmux", "new-window", "-d", "-t", session + ":", "-n", window, "-c", cwd, "-P", "-F", "#{pane_id}"])
+            created = "window %s:%s" % (session, window)
+        if rc != 0 or not out.strip().startswith("%"):
+            D.die("tmux failed to create %s (is the tmux server up? TMUX_TMPDIR=%s)" % (created, os.environ.get("TMUX_TMPDIR")))
+        pane = out.strip()
+        print("created tmux %s -> pane %s (cwd %s)" % (created, pane, cwd))
+    # server account first (token needed for the registry), reused if it exists
+    u = admin(["ensure", handle, "--project", project])
+    print("server account %s: %s (project %s)" % (handle, "created" if u.get("created") else "reused", project))
+    # register BEFORE launching so the runtime's very first hook event finds its pane in fleet.json
+    ent = dict(existing or {})
+    ent.update({"token": u["token"], "runtime": runtime, "pane": pane, "project": project, "cwd": cwd})
+    ent.pop("no_watcher", None)
+    if opts.get("no_watcher"):
+        ent["no_watcher"] = True
+    for k in ("watcher", "watcher_pane", "session_name", "session_id"):
+        ent.pop(k, None)
+    handles[handle] = ent
+    fleet["handles"] = dict(sorted(handles.items()))
+    fleet["retired"] = [r for r in (fleet.get("retired") or []) if r != handle]
+    touch(fleet)
+    write_fleet(fleet)
+    write_registry_from(fleet, quiet=True)
+    print("registered %s: pane %s runtime %s project %s -> %s" % (handle, pane, runtime, project, FLEET_PATH))
+    # launch the runtime unless the pane already runs it
+    cur = tmux_panes().get(pane) or {}
+    if cur.get("cmd") == expect:
+        print("pane %s already runs %s — not relaunching" % (pane, expect))
+    else:
+        launch = opts.get("cmd") or runtime
+        if cur.get("cmd") not in ("bash", "zsh", "sh", "fish", None):
+            D.die("pane %s is running %s, not a shell — stop it or pass another --pane" % (pane, cur.get("cmd")))
+        sh(["tmux", "send-keys", "-t", pane, "cd %s && %s" % (shlex.quote(cwd), launch), "Enter"])
+        print("launched: %s (in %s)" % (launch, cwd))
+    ok = True
+    if not opts.get("no_wait"):
+        timeout = int(opts.get("timeout") or 120)
+        if runtime == "claude":
+            ok, note = wait_for_claude(pane, timeout)
+        else:
+            ok, note = wait_for_cmd(pane, expect, timeout)
+        print("%s: %s" % ("ready" if ok else "NOT READY", note))
+    if runtime == "claude":
+        s = None
+        for _ in range(15):
+            s = D.session_for_pane(pane)
+            if s:
+                break
+            time.sleep(1)
+        if s:
+            ent["session_name"] = s["name"]
+            ent["cwd"] = s["cwd"] or cwd
+            ent["session_id"] = s["session_id"]
+            print("Claude session: %s (%s)" % (s["name"], s["status"]))
+        else:
+            print("note: no ~/.claude/sessions record for pane %s yet (dispatch-fleet sync picks it up later)" % pane)
+        touch(fleet)
+        write_fleet(fleet)
+    if not opts.get("no_watcher"):
+        cmd_watchers(restart=True, only=handle)
+    else:
+        print("no watcher (hooks-only handle)")
+    print("done: %s in project %s. Test it: dispatch-send %s --type task --title \"hello\" \"[TASK] ack and report done\"" % (handle, project, handle))
+    if opts.get("json"):
+        print(json.dumps({"handle": handle, "pane": pane, "project": project, "runtime": runtime, "cwd": cwd, "ready": ok}))
+    return 0 if ok else 1
 
 
 WATCHER_SCRIPT = "/var/solana/data/dispatch-mcp/skills/dispatch-worktree/scripts/dispatch-watch.js"
@@ -274,6 +687,7 @@ def cmd_check(as_json=False):
             if ent.get("token"):
                 tok = ent["token"]
                 break
+    sprojects = None
     if tok:
         try:
             st, d = D.http("GET", "/fleet", token=tok, timeout=5)
@@ -281,13 +695,18 @@ def cmd_check(as_json=False):
                 server = {r["handle"]: r for r in d.get("handles", [])}
             else:
                 server_err = (d or {}).get("error") or "HTTP %s" % st
+            st, d = D.http("GET", "/projects", token=tok, timeout=5)
+            if st == 200 and d:
+                sprojects = {p["name"]: p for p in d.get("projects", [])}
         except D.DispatchError as e:
             server_err = str(e)
+    fprojects = fleet.get("projects") or {}
     rows = []
     problems = 0
     for h, ent in sorted(fleet.get("handles", {}).items()):
         pane = ent.get("pane") or ""
         runtime = ent.get("runtime") or "?"
+        project = ent.get("project") or ""
         expect = RUNTIME_CMD.get(runtime, runtime)
         p = panes.get(pane)
         cmd = p["cmd"] if p else "(no pane)"
@@ -319,10 +738,17 @@ def cmd_check(as_json=False):
             wstat = "hooks-only"
         if runtime == "claude" and p and match and not s:
             verdict.append("no Claude session record")
+        # multi-project: every handle carries a project that exists on both sides
+        if not project:
+            verdict.append("NO PROJECT")
+        elif project not in fprojects:
+            verdict.append("UNKNOWN PROJECT %s" % project)
+        if sv and project and (sv.get("project") or "") != project:
+            verdict.append("PROJECT MISMATCH (server: %s)" % (sv.get("project") or "none"))
         if verdict:
             problems += 1
         rows.append({
-            "handle": h, "pane": pane, "runtime": runtime, "pane_cmd": cmd, "expect": expect,
+            "handle": h, "project": project, "pane": pane, "runtime": runtime, "pane_cmd": cmd, "expect": expect,
             "match": match, "watcher": wstat, "watcher_pane": wpane,
             "session": sname, "session_status": sstat,
             "state": sv.get("state"), "unread": sv.get("unread"), "unread_high_plus": sv.get("unread_high_plus"),
@@ -342,10 +768,34 @@ def cmd_check(as_json=False):
     else:
         drift = ["no %s (repo path: set fleet.json \"repo\" or $DISPATCH_REPO)" % chk]
     problems += len(drift)
+    # projects: fleet.json and the server must agree, and each coordinator needs an account
+    proj_rows = []
+    for name in sorted(set(fprojects) | set(sprojects or {})):
+        f = fprojects.get(name)
+        sv = (sprojects or {}).get(name)
+        pv = []
+        if not f:
+            pv.append("NOT IN fleet.json")
+        if sprojects is not None and not sv:
+            pv.append("NOT ON SERVER")
+        if f and sv:
+            for key in ("coordinator", "tmux_session", "coordination_dir"):
+                if (f.get(key) or None) != (sv.get(key) or None):
+                    pv.append("%s differs (server: %s)" % (key, sv.get(key) or "-"))
+            if not sv.get("coordinator_exists"):
+                pv.append("coordinator %s has no server account" % sv.get("coordinator"))
+        elif f and f.get("coordinator") and server and f["coordinator"] not in server:
+            pv.append("coordinator %s has no server account" % f["coordinator"])
+        src = f or sv or {}
+        proj_rows.append({"project": name, "coordinator": src.get("coordinator"), "tmux_session": src.get("tmux_session"),
+                          "coordination_dir": src.get("coordination_dir"), "local_handles": local_handles_in(fleet, name),
+                          "server_handles": (sv or {}).get("handle_count"), "verdict": "; ".join(pv) or "ok"})
+        if pv:
+            problems += 1
     if as_json:
-        print(json.dumps({"server_error": server_err, "cli_drift": drift, "rows": rows}, ensure_ascii=False, indent=2))
+        print(json.dumps({"server_error": server_err, "cli_drift": drift, "projects": proj_rows, "rows": rows}, ensure_ascii=False, indent=2))
         return 1 if problems else 0
-    cols = [("handle", 13), ("pane", 5), ("runtime", 7), ("pane_cmd", 9), ("match", 5),
+    cols = [("handle", 13), ("project", 9), ("pane", 5), ("runtime", 7), ("pane_cmd", 9), ("match", 5),
             ("watcher", 8), ("session", 30), ("session_status", 6), ("state", 8),
             ("unread", 6), ("open_tasks", 5), ("verdict", 0)]
     hdr = "  ".join((c if w == 0 else c.ljust(w))[:w or 99] for c, w in cols)
@@ -363,13 +813,20 @@ def cmd_check(as_json=False):
             cells.append(v if w == 0 else v.ljust(w)[:w])
         print("  ".join(cells).rstrip())
     print("")
+    for pr in proj_rows:
+        print("project %-10s coordinator %-14s tmux %-12s handles %d local / %s server  dir %s  %s" % (
+            pr["project"], pr["coordinator"] or "-", pr["tmux_session"] or "-", len(pr["local_handles"]),
+            pr["server_handles"] if pr["server_handles"] is not None else "?", pr["coordination_dir"] or "-",
+            pr["verdict"] if pr["verdict"] != "ok" else "ok"))
+    if not proj_rows:
+        print("projects: none defined (dispatch-fleet project add <name> ...)")
     if drift:
         for d in drift:
             print("cli drift: %s" % d)
         print("           fix: %s" % chk)
     else:
         print("cli: ~/.dispatch matches %s/cli" % repo)
-    print("%d handle(s), %d problem(s).%s" % (len(rows), problems, "  server: %s" % server_err if server_err else ""))
+    print("%d handle(s), %d project(s), %d problem(s).%s" % (len(rows), len(proj_rows), problems, "  server: %s" % server_err if server_err else ""))
     return 1 if problems else 0
 
 
@@ -378,8 +835,13 @@ def main(argv):
         print(__doc__.strip())
         return 0 if argv else 2
     cmd = argv[0]
+    ensure_tmux_env()
     if cmd == "check":
         return cmd_check(as_json="--json" in argv)
+    if cmd == "project":
+        return cmd_project(argv[1:])
+    if cmd == "add":
+        return cmd_add(argv[1:])
     if cmd == "sync":
         return cmd_sync(write="--write" in argv, prune="--prune" in argv)
     if cmd == "remove":

@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 """Send a dispatch message.
 
-usage: dispatch-send <to|all> [--type T] [--title "<task title>"] [--priority P]
+usage: dispatch-send <to|all|coord> [--type T] [--title "<task title>"] [--priority P]
                      [--ack yes|no|auto] [--re <id>] [--task <T-id>] [--state S]
-                     [--attach <path>]... [--force] [--json] "<body>"
+                     [--project <name>] [--attach <path>]... [--force] [--json] "<body>"
+
+<to> = a handle, "all" (broadcast) or "coord" = YOUR project's coordinator
+(resolved by the server from fleet.json's projects; Pearl's coordinator is the
+literal handle coord, so nothing changes there). --project files a type=task
+under another project (default: the sender's project → its coordination/tasks/).
 
 --title (type=task, recommended): the task's title as stored in the tasks table
 and used for the coordination/tasks/T-…-<slug>.md mirror filename. Without it
@@ -31,7 +36,7 @@ def main(argv):
     args = argv[1:]
     opts = {"type": "info", "priority": os.environ.get("PRIORITY") or "medium", "ack": "no",
             "re": None, "task": None, "state": None, "attach": [], "force": False, "json": False,
-            "title": None}
+            "title": None, "project": None}
     body_parts = []
     i = 0
     while i < len(args):
@@ -51,6 +56,8 @@ def main(argv):
             opts["type"] = val()
         elif a == "--title":
             opts["title"] = val()
+        elif a == "--project":
+            opts["project"] = val()
         elif a in ("--priority", "-p"):
             opts["priority"] = val()
         elif a == "--ack":
@@ -128,6 +135,7 @@ def main(argv):
         "attachments": attachments,
         "force": opts["force"],
         "title": opts["title"],
+        "project": opts["project"],
     }
     try:
         status, d = D.http("POST", "/msg/send", payload, token=tok, timeout=10)
@@ -150,7 +158,7 @@ def main(argv):
             extra.append("acked %s" % d["acked"])
         if d.get("answered"):
             extra.append("answered %s" % d["answered"])
-        line = "sent -> %s  (id %s" % (d.get("to"), d.get("id"))
+        line = "sent -> %s%s  (id %s" % (d.get("to"), " (alias %s)" % d["alias"] if d.get("alias") else "", d.get("id"))
         if opts["type"] != "info" or pri != "medium":
             line += ", %s/%s" % (opts["type"], pri)
         line += ")"
@@ -159,7 +167,7 @@ def main(argv):
         print(line)
         # Idle-wake hint: if the recipient is a Claude session that is idle,
         # SendMessage is the native way to start its next turn now.
-        wake_hint(to, d.get("id"))
+        wake_hint(d.get("resolved_to") or to, d.get("id"))
     return 0
 
 

@@ -60,8 +60,14 @@ import {
   setSetting,
   markHandling,
   nextHandlingExpiry,
+  listProjects,
+  getProject,
+  projectOf,
+  coordinatorFor,
+  handlesInProject,
+  projectSummary,
 } from "./store.js";
-import { writeTaskMirror, TASKS_DIR } from "./mirror.js";
+import { writeTaskMirror, TASKS_DIR, tasksDirForProject } from "./mirror.js";
 import { execFile } from "child_process";
 import { readFileSync as readFileSyncFs } from "fs";
 import { homedir } from "os";
@@ -930,9 +936,32 @@ function handleSend(identity, payload) {
   const p = payload || {};
   const bad = (status, error, extra = {}) => ({ status, body: { delivered: false, error, ...extra } });
 
-  const to = p.to && p.to !== "all" ? String(p.to) : null;
+  let to = p.to && p.to !== "all" ? String(p.to) : null;
   const body = p.body;
   if (!body || typeof body !== "string") return bad(400, "body (string) is required");
+  // `coord` is an alias for the sender's project coordinator (multi-project
+  // D3): the global CLAUDE.md rule "dispatch-send coord ..." keeps working in
+  // every project. Pearl's coordinator IS the literal handle `coord`, so Pearl
+  // agents (and senders with no project) are untouched. A project whose
+  // coordinator has no server account fails loudly instead of misrouting.
+  let alias = null;
+  if (to === "coord") {
+    const c = coordinatorFor(identity);
+    if (c && c !== "coord") {
+      if (!getUserByHandle(c)) {
+        return bad(404, `your project's coordinator '${c}' has no server account yet — message NOT delivered (dispatch-fleet add ${c} …, or dispatch-fleet project add <project> --coordinator <handle>)`);
+      }
+      alias = "coord";
+      to = c;
+    }
+  }
+  // Project a task is filed under: explicit `project`, else the sender's,
+  // else the recipient's. Only meaningful for type=task (it decides which
+  // coordination/tasks/ the mirror lands in) but validated for every type.
+  const explicitProject = p.project !== undefined && p.project !== null && String(p.project).trim() ? String(p.project).trim() : null;
+  if (explicitProject && !getProject(explicitProject)) {
+    return bad(404, `unknown project '${explicitProject}'. Known: ${listProjects().map((x) => x.name).join(", ") || "(none)"}`);
+  }
   const nChars = charCount(body);
   if (nChars > BODY_MAX_CHARS) {
     return bad(
@@ -1002,11 +1031,12 @@ function handleSend(identity, payload) {
   const effects = {};
   // type=task → a task row, linked both ways.
   if (type === "task") {
-    const task = createTaskFromMessage(message, title);
+    const taskProject = explicitProject || projectOf(identity) || (to ? projectOf(to) : null) || null;
+    const task = createTaskFromMessage(message, title, taskProject);
     if (task) {
       db.prepare(`UPDATE messages SET task_id = ? WHERE id = ?`).run(task.id, message.id);
       message.task_id = task.id;
-      effects.task = { id: task.id, ack_required: !!task.ack_required, status: task.status };
+      effects.task = { id: task.id, ack_required: !!task.ack_required, status: task.status, project: task.project || null };
       emitTaskEvent("task_created", task, identity);
     }
   }
@@ -1046,6 +1076,7 @@ function handleSend(identity, payload) {
       delivered: true,
       id: message.id,
       to: to || "(broadcast)",
+      ...(alias ? { alias, resolved_to: to } : {}),
       type,
       priority,
       ack_required: ack === "yes" || (ack === "auto" && (priority === "high" || priority === "immediate")),
@@ -1239,6 +1270,7 @@ app.get("/fleet", (req, res) => {
     const open = getOpenTasksFor(u.handle);
     return {
       handle: u.handle,
+      project: u.project || null,
       last_seen_at: toDisplayTz(u.last_seen_at),
       mcp_connected: live.has(u.handle),
       state: p?.state || null,
@@ -1251,7 +1283,20 @@ app.get("/fleet", (req, res) => {
       unacked_tasks: open.filter((t) => t.ack_required && !t.acked_at).length,
     };
   });
-  res.json({ requested_by: identity, server_time: toDisplayTz(utcNow()), handles: rows });
+  res.json({ requested_by: identity, server_time: toDisplayTz(utcNow()), handles: rows, projects: listProjects() });
+});
+
+// Project registry as the server sees it (bearer auth; used by
+// `dispatch-fleet check` to verify fleet.json and the DB agree).
+app.get("/projects", (req, res) => {
+  const identity = httpIdentity(req, res);
+  if (!identity) return;
+  const sum = projectSummary();
+  res.json({
+    ...sum,
+    projects: sum.projects.map((p) => ({ ...p, tasks_dir: tasksDirForProject(p) })),
+    default_tasks_dir: TASKS_DIR,
+  });
 });
 
 // One message, full text. Only parties to it (sender, recipient, or anyone
@@ -1286,7 +1331,7 @@ function mirrorTask(taskId) {
     if (!t) return null;
     const health = taskHealth(t, thresholds());
     const thread = t.thread_id ? threadFor(t.thread_id) : null;
-    const path = writeTaskMirror(t, health, thread);
+    const path = writeTaskMirror(t, health, thread, tasksDirForProject(getProject(t.project)));
     dispatchEvents.emit("task", { type: "task_mirrored", task: { id: t.id, status: t.status }, actor: "server", recipients: [], timestamp: new Date().toISOString(), path });
     return path;
   } catch (e) {
@@ -1335,13 +1380,24 @@ function withDeliveries(msgs) {
   return msgs.map((m) => ({ ...m, created_at_display: toDisplayTz(m.created_at), deliveries: deliveriesFor(m.id) }));
 }
 
+// ?project=<name> scopes a dashboard view to one project; absent or "all" =
+// everything. Unknown project → empty handle list → empty view (not an error,
+// the switcher may remember a project that was removed since).
+function projectScope(req) {
+  const p = req.query.project ? String(req.query.project).trim() : "";
+  if (!p || p === "all") return { project: null, handles: null };
+  return { project: p, handles: handlesInProject(p) };
+}
+
 app.get("/api/messages", requireJwt, (req, res) => {
   const q = req.query;
+  const scope = projectScope(req);
   const rows = listMessages({
     from: q.from || null, to: q.to || null, type: q.type || null,
     priority: q.priority ? normalizePriority(q.priority) : null, status: q.status || null,
     task: q.task || null, since: q.since || null, until: q.until || null, q: q.q || null,
     limit: parseInt(q.limit || "200", 10) || 200,
+    handles: scope.handles,
   });
   res.json({ count: rows.length, messages: withDeliveries(rows) });
 });
@@ -1362,13 +1418,14 @@ app.get("/api/inbox", requireJwt, (req, res) => {
   const presence = new Map(getPresence().map((p) => [p.user, p]));
   const { kindOf } = classifyHandles();
   const order = { local: 0, remote: 1 };
-  const rows = listUsers().filter((u) => kindOf(u.handle) !== "retired").map((u) => {
+  const scope = projectScope(req);
+  const rows = listUsers().filter((u) => kindOf(u.handle) !== "retired" && (!scope.project || u.project === scope.project)).map((u) => {
     const d = inboxDepth(u.handle);
     const p = presence.get(u.handle);
     const unacked = unackedRequiredFor(u.handle);
     const open = getOpenTasksFor(u.handle);
     return {
-      handle: u.handle, kind: kindOf(u.handle), last_seen_at: toDisplayTz(u.last_seen_at), last_seen_ip: u.last_seen_ip || null,
+      handle: u.handle, kind: kindOf(u.handle), project: u.project || null, last_seen_at: toDisplayTz(u.last_seen_at), last_seen_ip: u.last_seen_ip || null,
       state: p?.state || null, state_at: toDisplayTz(p?.state_at || null), session: p?.session || null,
       unread: d.n || 0, unread_high_plus: d.high_plus || 0,
       oldest_unread_at: toDisplayTz(d.oldest), oldest_unread_age_s: d.oldest ? Math.round((Date.now() - new Date(d.oldest.replace(" ", "T") + "Z").getTime()) / 1000) : null,
@@ -1377,7 +1434,12 @@ app.get("/api/inbox", requireJwt, (req, res) => {
       unacked_tasks: open.filter((t) => t.ack_required && !t.acked_at).map((t) => t.id),
     };
   }).sort((a, b) => (order[a.kind] - order[b.kind]) || a.handle.localeCompare(b.handle));
-  res.json({ server_time: toDisplayTz(utcNow()), handles: rows });
+  res.json({ server_time: toDisplayTz(utcNow()), project: scope.project, handles: rows });
+});
+
+app.get("/api/projects", requireJwt, (req, res) => {
+  const sum = projectSummary();
+  res.json({ ...sum, projects: sum.projects.map((p) => ({ ...p, tasks_dir: tasksDirForProject(p) })), default_tasks_dir: TASKS_DIR });
 });
 
 // Fleet health = the CLI's `dispatch-fleet check --json` (so the page and the
@@ -1420,42 +1482,45 @@ function classifyHandles() {
   return { fleet, kindOf: (h) => (retired.has(h) ? "retired" : local.has(h) ? "local" : "remote") };
 }
 app.get("/api/fleet", requireJwt, (req, res) => {
+  const scope = projectScope(req);
   fleetCheck((data) => {
     const presence = new Map(getPresence().map((p) => [p.user, p]));
     const rows = (data.rows || []).map((r) => {
       const p = presence.get(r.handle);
-      return { ...r, presence_state: p?.state || null, presence_at: toDisplayTz(p?.state_at || null), presence_session: p?.session || null };
-    });
+      return { ...r, project: r.project || projectOf(r.handle), presence_state: p?.state || null, presence_at: toDisplayTz(p?.state_at || null), presence_session: p?.session || null };
+    }).filter((r) => !scope.project || r.project === scope.project);
     const { fleet, kindOf } = classifyHandles();
     const retired = fleet.retired || [];
     const rowHandles = new Set(rows.map((r) => r.handle));
     const remote = listUsers()
-      .filter((u) => kindOf(u.handle) === "remote" && !rowHandles.has(u.handle))
+      .filter((u) => kindOf(u.handle) === "remote" && !rowHandles.has(u.handle) && (!scope.project || u.project === scope.project))
       .map((u) => {
         const p = presence.get(u.handle);
         const d = inboxDepth(u.handle);
         return {
-          handle: u.handle, last_seen_at: toDisplayTz(u.last_seen_at), last_seen_ip: u.last_seen_ip || null,
+          handle: u.handle, project: u.project || null, last_seen_at: toDisplayTz(u.last_seen_at), last_seen_ip: u.last_seen_ip || null,
           presence_state: p?.state || null, presence_at: toDisplayTz(p?.state_at || null), presence_session: p?.session || null,
           unread: d.n || 0, unread_high_plus: d.high_plus || 0, oldest_unread_at: toDisplayTz(d.oldest),
           open_tasks: getOpenTasksFor(u.handle).length,
         };
       });
-    res.json({ ...data, rows, remote, retired });
+    res.json({ ...data, rows, remote, retired, project: scope.project, projects: projectSummary().projects });
   });
 });
 
 app.get("/api/tasks", requireJwt, (req, res) => {
   const th = thresholds();
-  const tasks = listAllTasks(parseInt(req.query.limit || "300", 10) || 300).map((t) => ({
+  const scope = projectScope(req);
+  const tasks = listAllTasks(parseInt(req.query.limit || "300", 10) || 300, scope).map((t) => ({
     ...t, health: taskHealth(t, th),
     created_at_display: toDisplayTz(t.created_at), updated_at_display: toDisplayTz(t.updated_at), acked_at_display: toDisplayTz(t.acked_at),
   }));
-  res.json({ thresholds: th, tasks });
+  res.json({ thresholds: th, project: scope.project, tasks });
 });
 
 app.get("/api/settings", requireJwt, (req, res) => {
-  res.json({ task_stale_hours: thresholds().staleHours, task_max_continuing: thresholds().maxContinuing, tasks_dir: TASKS_DIR });
+  res.json({ task_stale_hours: thresholds().staleHours, task_max_continuing: thresholds().maxContinuing, tasks_dir: TASKS_DIR,
+    projects: listProjects().map((p) => ({ ...p, tasks_dir: tasksDirForProject(p) })) });
 });
 
 app.post("/api/settings", requireJwt, express.json(), (req, res) => {
@@ -1474,7 +1539,8 @@ app.post("/api/settings", requireJwt, express.json(), (req, res) => {
 });
 
 app.get("/api/decisions", requireJwt, (req, res) => {
-  res.json({ requests: withDeliveries(openRequests()) });
+  const scope = projectScope(req);
+  res.json({ project: scope.project, requests: withDeliveries(openRequests({ handles: scope.handles })) });
 });
 
 // Send a message AS the logged-in dashboard account. Used by the decisions
@@ -1503,8 +1569,10 @@ app.post("/api/decide", requireJwt, express.json(), (req, res) => {
 
 app.post("/api/tasks/mirror-all", requireJwt, (req, res) => {
   const out = [];
-  for (const t of listAllTasks(1000)) if (/^T-\d{8}-\d+$/.test(t.id)) out.push({ id: t.id, path: mirrorTask(t.id) });
-  res.json({ mirrored: out.length, tasks_dir: TASKS_DIR, files: out });
+  const scope = projectScope(req);
+  for (const t of listAllTasks(1000, scope)) if (/^T-\d{8}-\d+$/.test(t.id)) out.push({ id: t.id, project: t.project || null, path: mirrorTask(t.id) });
+  const dirs = [...new Set(out.map((o) => o.path && o.path.replace(/\/[^/]+$/, "")).filter(Boolean))];
+  res.json({ mirrored: out.length, tasks_dir: dirs.length === 1 ? dirs[0] : TASKS_DIR, tasks_dirs: dirs, files: out });
 });
 
 app.get("/api/deliveries", requireJwt, (req, res) => {

@@ -58,6 +58,8 @@ import {
   taskHealth,
   getSetting,
   setSetting,
+  markHandling,
+  nextHandlingExpiry,
 } from "./store.js";
 import { writeTaskMirror, TASKS_DIR } from "./mirror.js";
 import { execFile } from "child_process";
@@ -1078,9 +1080,10 @@ app.get("/msg/recv", (req, res) => {
   if (!minPriority) return res.status(400).json({ error: `bad priority filter '${req.query.priority}'` });
   const limit = Math.max(0, parseInt(req.query.limit || "0", 10) || 0);
   const peek = req.query.peek === "1" || req.query.peek === "true";
+  const excludeHandling = req.query.exclude_handling === "1";
   let messages, remaining;
   if (peek) {
-    messages = peekUnreadMessages(identity, { minPriority, limit });
+    messages = peekUnreadMessages(identity, { minPriority, limit, excludeHandling });
     remaining = countUnread(identity).total - messages.length;
   } else {
     ({ messages, remaining } = pullUnreadMessages(identity, { minPriority, limit }));
@@ -1118,12 +1121,24 @@ app.get("/msg/wait", (req, res) => {
   const timeoutS = Math.min(WAIT_MAX_S, Math.max(1, parseInt(req.query.timeout || "60", 10) || 60));
   const minRank = PRIORITY_RANK[minPriority];
 
-  const check = () => peekUnreadMessages(identity, { minPriority });
+  // Messages a hook already delivered (handling_until in the future) are not
+  // a reason to rewake; if one is still unread when its handling window ends,
+  // a re-check timer picks it up then.
+  const check = () => peekUnreadMessages(identity, { minPriority, excludeHandling: true });
   let done = false;
+  let recheck = null;
+  const armRecheck = () => {
+    const exp = nextHandlingExpiry(identity, minPriority);
+    if (!exp || done) return;
+    const ms = Math.max(500, new Date(exp.replace(" ", "T") + "Z").getTime() - Date.now() + 500);
+    clearTimeout(recheck);
+    recheck = setTimeout(() => { const f = check(); if (f.length > 0) finish(f, false); else armRecheck(); }, ms);
+  };
   const finish = (messages, timedOut) => {
     if (done) return;
     done = true;
     clearTimeout(timer);
+    clearTimeout(recheck);
     dispatchEvents.off("task", handler);
     res.json({
       handle: identity,
@@ -1139,16 +1154,18 @@ app.get("/msg/wait", (req, res) => {
     if (m.to_user && m.to_user !== identity) return;
     if ((PRIORITY_RANK[m.priority] ?? 1) < minRank) return;
     const found = check();
-    if (found.length > 0) finish(found, false);
+    if (found.length > 0) finish(found, false); else armRecheck();
   };
   const timer = setTimeout(() => finish(check(), true), timeoutS * 1000);
   const first = check();
   if (first.length > 0) return finish(first, false);
+  armRecheck();
   dispatchEvents.on("task", handler);
   req.on("close", () => {
     if (done) return;
     done = true;
     clearTimeout(timer);
+    clearTimeout(recheck);
     dispatchEvents.off("task", handler);
   });
 });
@@ -1173,6 +1190,7 @@ app.get("/hook/digest", (req, res) => {
     task_id: m.task_id,
     re: m.re,
     created_at: toDisplayTz(m.created_at),
+    handling_until: m.handling_until || null,
     summary: m.body.length > 120 ? m.body.slice(0, 117).replace(/\s+/g, " ") + "..." : m.body.replace(/\s+/g, " "),
     chars: charCount(m.body),
     attachments: m.attachments.length,
@@ -1288,8 +1306,27 @@ app.post("/wake", express.json(), (req, res) => {
   const ids = Array.isArray(b.message_ids) ? b.message_ids.map(String).slice(0, 50) : [];
   const handle = b.handle && identity !== b.handle ? String(b.handle) : identity; // a sender may record a hint for its recipient
   const n = recordDelivery(handle, method, ids, b.detail ? String(b.detail).slice(0, 300) : null);
+  // A hook delivery means the agent has the text in front of it: give it
+  // HANDLING_S before any other path (watcher keystroke, Wait rewake) may act.
+  let handling = 0;
+  if ((method === "hook" || method === "wait-rewake") && ids.length) handling = markHandling(ids, HANDLING_S);
   dispatchEvents.emit("task", { type: "delivery", delivery: { handle, method, message_ids: ids, detail: b.detail || null }, actor: "server", recipients: [], timestamp: new Date().toISOString() });
-  res.json({ ok: true, recorded: n });
+  res.json({ ok: true, recorded: n, handling });
+});
+const HANDLING_S = parseInt(process.env.DISPATCH_HANDLING_S || "60", 10);
+
+// Presence of the caller (watcher idle gate, T-20260903-09). `fresh` = the
+// hook-reported state is younger than DISPATCH_PRESENCE_MAX_AGE_S (default 6h);
+// older states are stale (session may have died) and callers fall back to
+// screen-based detection.
+const PRESENCE_MAX_AGE_S = parseInt(process.env.DISPATCH_PRESENCE_MAX_AGE_S || "21600", 10);
+app.get("/presence/me", (req, res) => {
+  const identity = httpIdentity(req, res);
+  if (!identity) return;
+  const p = getPresence().find((x) => x.user === identity);
+  const ageS = p?.state_at ? Math.round((Date.now() - new Date(p.state_at.replace(" ", "T") + "Z").getTime()) / 1000) : null;
+  res.json({ handle: identity, state: p?.state || null, state_at: toDisplayTz(p?.state_at || null), age_s: ageS,
+             fresh: ageS !== null && ageS <= PRESENCE_MAX_AGE_S, session: p?.session || null });
 });
 
 // ── P2: dashboard JSON API (JWT cookie) ────────────────────────────

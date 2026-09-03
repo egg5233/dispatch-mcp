@@ -37,7 +37,7 @@ before(async () => {
   base = `http://127.0.0.1:${port}`;
   // create users directly through the store (same DB dir)
   process.env.DISPATCH_TASKS_DIR = join(dataDir, "tasks");
-  const env = { ...process.env, DISPATCH_DATA_DIR: dataDir, PORT: String(port), DISPATCH_TASKS_DIR: process.env.DISPATCH_TASKS_DIR };
+  const env = { ...process.env, DISPATCH_DATA_DIR: dataDir, PORT: String(port), DISPATCH_TASKS_DIR: process.env.DISPATCH_TASKS_DIR, DISPATCH_HANDLING_S: "2" };
   const setup = spawn(process.execPath, ["--input-type=module", "-e", `
     import { addUser } from "${ROOT}/src/store.js";
     const out = {};
@@ -377,4 +377,38 @@ test("task title: explicit --title wins; fallback strips [TASK] tag and cuts at 
   await send("dev", { to: "coord", body: "[DONE]", type: "report", state: "done", re: a.body.task_id });
   await send("dev", { to: "coord", body: "[DONE]", type: "report", state: "done", re: b.body.task_id });
   await api("dev", "GET", "/msg/recv"); await api("coord", "GET", "/msg/recv");
+});
+
+test("handling window: a hook delivery hides the message from peek?exclude_handling and from /msg/wait until it expires", async () => {
+  const m = await send("coord", { to: "dev", body: "stop-block me", priority: "high" });
+  // hook says: I put it in front of the agent (Stop block)
+  const w = await api("dev", "POST", "/wake", { method: "hook", message_ids: [m.body.id], detail: "Stop block" });
+  assert.equal(w.body.handling, 1);
+  let r = (await api("dev", "GET", "/msg/recv?peek=1&priority=medium&exclude_handling=1")).body;
+  assert.equal(r.count, 0, "watcher's grace peek must not see it");
+  r = (await api("dev", "GET", "/msg/recv?peek=1&priority=medium")).body;
+  assert.equal(r.count, 1, "plain peek still sees it");
+  // the waiter must not rewake for it now, but must after the window (2 s in tests)
+  const t0 = Date.now();
+  const wr = (await api("dev", "GET", "/msg/wait?priority=medium%2B&timeout=6")).body;
+  assert.equal(wr.timed_out, false);
+  assert.equal(wr.messages[0].id, m.body.id);
+  const dt = Date.now() - t0;
+  assert.ok(dt >= 1500 && dt < 5000, `should fire at handling expiry, took ${dt}ms`);
+  // keystroke / native-hint records do NOT mark handling
+  const m2 = await send("coord", { to: "dev", body: "typed", priority: "high" });
+  await api("dev", "POST", "/wake", { method: "keystroke", message_ids: [m2.body.id] });
+  r = (await api("dev", "GET", "/msg/recv?peek=1&priority=medium&exclude_handling=1")).body;
+  assert.ok(r.messages.some((x) => x.id === m2.body.id));
+  await api("dev", "GET", "/msg/recv");
+});
+
+test("presence/me: busy is fresh; unknown handle has no state", async () => {
+  await api("dev", "POST", "/presence", { state: "busy", session: "s" });
+  let p = (await api("dev", "GET", "/presence/me")).body;
+  assert.equal(p.state, "busy");
+  assert.equal(p.fresh, true);
+  p = (await api("other", "GET", "/presence/me")).body;
+  assert.equal(p.state, null);
+  assert.equal(p.fresh, false);
 });

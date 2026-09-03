@@ -355,7 +355,7 @@ function pokeTmux() {
 function stillUnread(cb) {
   if (!BASE_URL || !TOKEN) return cb(true);
   try {
-    const u = new URL(BASE_URL + "/msg/recv?peek=1&priority=medium&limit=1");
+    const u = new URL(BASE_URL + "/msg/recv?peek=1&priority=medium&limit=1&exclude_handling=1");
     const mod = u.protocol === "https:" ? https : http;
     const req = mod.request({ host: u.hostname, port: u.port || (u.protocol === "https:" ? 443 : 80), path: u.pathname + u.search, method: "GET",
       headers: { Authorization: `Bearer ${TOKEN}` }, timeout: 3000 }, (res) => {
@@ -367,6 +367,27 @@ function stillUnread(cb) {
     req.on("timeout", () => { req.destroy(); cb(true); });
     req.end();
   } catch { cb(true); }
+}
+
+// Presence gate (T-20260903-09): the hooks report busy on UserPromptSubmit and
+// on a blocked Stop, turn_end on a real Stop, idle on idle_prompt. A fresh
+// "busy" means the agent is mid-turn even when the screen shows no
+// "esc to interrupt" (e.g. the continuation after a Stop block). cb(busy).
+function presenceBusy(cb) {
+  if (!BASE_URL || !TOKEN) return cb(false);
+  try {
+    const u = new URL(BASE_URL + "/presence/me");
+    const mod = u.protocol === "https:" ? https : http;
+    const req = mod.request({ host: u.hostname, port: u.port || (u.protocol === "https:" ? 443 : 80), path: u.pathname, method: "GET",
+      headers: { Authorization: `Bearer ${TOKEN}` }, timeout: 3000 }, (res) => {
+      let body = "";
+      res.on("data", (c) => (body += c));
+      res.on("end", () => { try { const p = JSON.parse(body); cb(p.fresh && p.state === "busy", p); } catch { cb(false); } });
+    });
+    req.on("error", () => cb(false));
+    req.on("timeout", () => { req.destroy(); cb(false); });
+    req.end();
+  } catch { cb(false); }
 }
 
 let graceChecking = false;
@@ -381,7 +402,7 @@ function maybeWake() {
     return stillUnread((unread) => {
       graceChecking = false;
       if (!unread) {
-        console.log(`[${ts()}] no keystroke: hooks delivered within ${Math.round(waited / 1000)}s (${lastLabel})`);
+        console.log(`[${ts()}] no keystroke: hooks delivered or handling within ${Math.round(waited / 1000)}s (${lastLabel})`);
         postWake("hook", `delivered by hooks within grace (${Math.round(waited / 1000)}s), watcher stood down`);
         wakePending = false; pendingIds = []; clearBlocked();
         return;
@@ -393,6 +414,14 @@ function maybeWake() {
 }
 
 function fireIfIdle(waitedMs) {
+  // Presence is the first criterion for Claude panes; the screen check follows.
+  presenceBusy((busy, p) => {
+    if (busy && !GUARDS_OFF) return logBlocked(`presence busy (${p.state} ${p.age_s}s ago, hooks mid-turn)`);
+    fireIfIdleScreen(waitedMs);
+  });
+}
+
+function fireIfIdleScreen(waitedMs) {
   checkGuards((ok, reason) => {
     if (!wakePending) return;      // drained while checking
     if (!ok) { logBlocked(reason); return; }  // retry next tick; payload safe on server

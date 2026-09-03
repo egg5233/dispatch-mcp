@@ -178,6 +178,10 @@ migrateColumn("messages", "closed_at", "closed_at TEXT");
 // `force` is not in the spec's column list but §4 needs it: only a sender
 // who explicitly passed --force gets the PreToolUse *deny* treatment.
 migrateColumn("messages", "force", "force INTEGER NOT NULL DEFAULT 0");
+// T-20260903-09: set when a hook has already put the message in front of the
+// agent (Stop block / immediate injection). While it is in the future the
+// watcher must not type and the Wait waiter must not rewake for it.
+migrateColumn("messages", "handling_until", "handling_until TEXT");
 // tasks: ack tracking + documents + the message thread that spawned it
 migrateColumn("tasks", "ack_required", "ack_required INTEGER NOT NULL DEFAULT 0");
 migrateColumn("tasks", "acked_at", "acked_at TEXT");
@@ -458,6 +462,9 @@ const stmts = {
   markDelivered: db.prepare(`
     UPDATE messages SET status = 'delivered', delivered_at = datetime('now')
      WHERE id = ? AND status = 'queued'
+  `),
+  setHandling: db.prepare(`
+    UPDATE messages SET handling_until = datetime('now', ?) WHERE id = ? AND status = 'queued'
   `),
   markMessagesSeenTo: db.prepare(`
     UPDATE users SET last_message_seen_at = ? WHERE handle = ?
@@ -858,14 +865,31 @@ function parseAttachments(rows) {
   return rows;
 }
 
-function unreadRows(handle, minPriority = "low") {
+function unreadRows(handle, minPriority = "low", { excludeHandling = false } = {}) {
   const rank = PRIORITY_RANK[minPriority] ?? 0;
-  return stmts.getUnreadMessages.all(handle, handle, handle, handle, rank);
+  const rows = stmts.getUnreadMessages.all(handle, handle, handle, handle, rank);
+  if (!excludeHandling) return rows;
+  const now = utcNow();
+  return rows.filter((m) => !m.handling_until || m.handling_until <= now);
+}
+
+// Mark messages as "in the agent's hands" for `seconds` (hook delivered them).
+export function markHandling(ids, seconds = 60) {
+  const mod = `+${Math.max(1, Math.min(3600, seconds))} seconds`;
+  const tx = db.transaction(() => { let n = 0; for (const id of ids) n += stmts.setHandling.run(mod, id).changes; return n; });
+  return tx();
+}
+
+// Earliest future handling_until among unread rows (for the wait re-check).
+export function nextHandlingExpiry(handle, minPriority = "low") {
+  const now = utcNow();
+  const fut = unreadRows(handle, minPriority).map((m) => m.handling_until).filter((h) => h && h > now).sort();
+  return fut[0] || null;
 }
 
 // Look at unread messages WITHOUT consuming them (hooks, /msg/wait).
-export function peekUnreadMessages(handle, { minPriority = "low", limit = 0 } = {}) {
-  const rows = unreadRows(handle, minPriority);
+export function peekUnreadMessages(handle, { minPriority = "low", limit = 0, excludeHandling = false } = {}) {
+  const rows = unreadRows(handle, minPriority, { excludeHandling });
   return parseAttachments(limit > 0 ? rows.slice(0, limit) : rows);
 }
 

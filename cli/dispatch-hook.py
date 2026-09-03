@@ -223,8 +223,8 @@ def main():
         return
 
     if event == "Stop":
-        presence(tok, "turn_end", session_name)
         if inp.get("stop_hook_active"):
+            presence(tok, "turn_end", session_name)
             return  # we already blocked once this stop; never loop
         turn_start = st.get("turn_start")
         d = digest(tok, since=turn_start)
@@ -245,13 +245,18 @@ def main():
         if reason:
             st["blocked_turn"] = turn_start
             save_state(handle, session_id, st)
+            # The block continues the turn: the agent stays BUSY, and the
+            # unread messages are now in its hands (handling window on the
+            # server keeps the watcher and the waiter off them).
             wake(tok, "hook", [i["id"] for i in d["unread"]["items"] if i["priority"] != "low"], "Stop block")
+            presence(tok, "busy", session_name)
             # Documented block signal for Stop: exit 2, stderr = reason. The JSON
             # form on stdout is kept for older builds that parse it.
             out({"decision": "block", "reason": reason})
             sys.stderr.write(reason + "\n")
             sys.stderr.flush()
             sys.exit(2)
+        presence(tok, "turn_end", session_name)
         return
 
     if event == "Notification":

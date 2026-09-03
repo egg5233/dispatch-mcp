@@ -85,9 +85,19 @@ For each agent the project needs:
 
 This creates the window, launches the runtime in `--cwd`, registers the pane and token, starts the `watch-<handle>` pm2 watcher, and for Claude waits until the prompt is ready. Handles are global: `<name>-<role>` avoids collisions with other projects' agents.
 
-**Registering a pane that already exists** (an agent the user started by hand): confirm the pane's foreground command is the runtime (`tmux display -p -t %N '#{pane_current_command}'` → `claude` or `node` for Codex), then use the `add` form that takes the pane instead of creating a window (`--pane %N`; see `dispatch-fleet --help`). If the pane is at a shell prompt the guards will refuse to type into it and `check` reports `pane_cmd=bash`; start the runtime in that pane first.
+**Registering a pane that already exists** (an agent the user started by hand):
 
-Each agent's own `CLAUDE.md` (in its repo, not in coordination/) needs only: the project name, the path of the coordination dir, and "read `~/.dispatch/PROTOCOL.md`". The report-to-coord rule is global.
+1. Look before typing: `tmux display -p -t %N '#{session_name}:#{window_index} #{pane_current_command} #{pane_current_path}'`. The foreground command must be the runtime (`claude`, or `node` for Codex). If it is a shell (`bash`), the pane is idle at a prompt: check nobody is typing there (`#{session_activity}` older than a minute), then start the runtime the way the rest of the fleet runs it, from the directory the agent should work in:
+
+   ```bash
+   tmux send-keys -t %N 'cd <repo> && claude --dangerously-skip-permissions' Enter
+   ```
+
+   Wait for the `❯` prompt (a first launch in a new directory shows the trust dialog; answer it). The guards refuse to type into a shell pane on purpose, and `check` reports `pane_cmd=bash` until the runtime is up.
+2. Register the pane instead of creating a window: the `add` form that takes an existing pane (`--pane %N`; see `dispatch-fleet --help`).
+3. `dispatch-fleet check` must show the handle with `match=yes` and its watcher `online`.
+
+Each agent's own `CLAUDE.md` (in its repo, not in coordination/) needs only: the project name, the path of the coordination dir, and "read `~/.dispatch/PROTOCOL.md`". The report-to-coord rule is global. If the repo is not yours to commit to, put those lines in `CLAUDE.local.md` next to it (Claude Code reads it, git ignores it).
 
 Codex agents: no `Stop` hook and no async rewake exist in Codex, so their idle wake is the guarded keystroke watcher only (README, "Codex sessions"). Everything else is the same.
 

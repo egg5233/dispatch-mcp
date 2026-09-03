@@ -229,6 +229,18 @@ db.exec(`UPDATE tasks    SET priority = 'immediate' WHERE priority = 'urgent'`);
 // machine has a single terminal-success state.
 db.exec(`UPDATE tasks SET status = 'closed' WHERE status = 'done'`);
 
+// One-time: T-* tasks created before --title existed got "[TASK] …" bodies
+// cut at 80 chars as their title. Re-derive with the current rule.
+{
+  const flag = db.prepare(`SELECT value FROM settings WHERE key = 'migr_p2_task_titles'`).get();
+  if (!flag) {
+    const rows = db.prepare(`SELECT id, description FROM tasks WHERE id LIKE 'T-%'`).all();
+    const upd = db.prepare(`UPDATE tasks SET title = ? WHERE id = ?`);
+    for (const r of rows) upd.run(deriveTaskTitle(r.description), r.id);
+    db.prepare(`INSERT INTO settings (key, value) VALUES ('migr_p2_task_titles', datetime('now'))`).run();
+  }
+}
+
 // Active statuses = tasks that are still live (open or being worked on).
 // Used by listTasks / listTasksForUser / my_tasks.
 // P1 adds acked / waiting / blocked (report states) to the live set.
@@ -589,12 +601,21 @@ export function createTask({
   return getTask(taskId);
 }
 
-// Task spawned by a type=task message. Title = first line of the body
-// (trimmed to 80 chars); the message id becomes thread_id so replies with
-// --re <msg id> resolve back to the task.
-export function createTaskFromMessage(msg) {
-  const firstLine = (msg.body || "").split("\n").find((l) => l.trim()) || "(untitled)";
-  const title = firstLine.trim().length > 80 ? firstLine.trim().slice(0, 77) + "..." : firstLine.trim();
+// Title for a task created from a message: an explicit --title wins;
+// otherwise the first non-empty body line with a leading "[TASK]"-style tag
+// removed, cut to 80 characters (code points).
+export function deriveTaskTitle(body, explicit = null) {
+  const cut = (str, n) => { const cps = [...str]; return cps.length > n ? cps.slice(0, n - 1).join("") + "…" : str; };
+  if (explicit && String(explicit).trim()) return cut(String(explicit).trim(), 80);
+  let line = (body || "").split("\n").find((l) => l.trim()) || "(untitled)";
+  line = line.trim().replace(/^(\[[A-Za-z0-9_\- ]+\]\s*)+/, "").trim() || line.trim();
+  return cut(line, 80);
+}
+
+// Task spawned by a type=task message. The message id becomes thread_id so
+// replies with --re <msg id> resolve back to the task.
+export function createTaskFromMessage(msg, explicitTitle = null) {
+  const title = deriveTaskTitle(msg.body, explicitTitle);
   const ackRequired =
     msg.ack === "yes" || (msg.ack === "auto" && (msg.priority === "high" || msg.priority === "immediate"));
   // Retry once on a same-second id collision (two senders in the same tick).

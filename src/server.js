@@ -961,6 +961,9 @@ function handleSend(identity, payload) {
   if (type === "report" && !state) state = "continuing";
   const attachments = normalizeAttachments(p.attachments);
   if (attachments === null) return bad(400, "attachments must be an array of paths or {path,size,sha256} objects");
+  const title = p.title !== undefined && p.title !== null ? String(p.title).trim() : null;
+  if (title && type !== "task") return bad(400, "title is only valid with type=task");
+  if (title && charCount(title) > 120) return bad(400, "title must be ≤ 120 chars");
   const force = p.force === true || p.force === 1 || p.force === "1" ? 1 : 0;
   if (force && priority !== "immediate") return bad(400, "--force requires --priority immediate");
 
@@ -997,7 +1000,7 @@ function handleSend(identity, payload) {
   const effects = {};
   // type=task → a task row, linked both ways.
   if (type === "task") {
-    const task = createTaskFromMessage(message);
+    const task = createTaskFromMessage(message, title);
     if (task) {
       db.prepare(`UPDATE messages SET task_id = ? WHERE id = ?`).run(task.id, message.id);
       message.task_id = task.id;

@@ -21,8 +21,8 @@ A message bus for a fleet of coding agents (Claude Code and Codex sessions in tm
 ~/.dispatch/dispatch-recv                                         # unread, one line each
 ~/.dispatch/dispatch-recv --full 27b8b9f0                         # full text of one message
 ~/.dispatch/dispatch-send coord "short note"                      # info / medium
-~/.dispatch/dispatch-send pearl-infra --type task --priority high --ack auto \
-    --attach /abs/path/spec.md "Title line\nDetails…"             # creates T-YYYYMMDD-NN
+~/.dispatch/dispatch-send pearl-infra --type task --title "Rotate the pool keys" --priority high --ack auto \
+    --attach /abs/path/spec.md "Details…"                          # creates T-YYYYMMDD-NN
 ~/.dispatch/dispatch-send coord --type ack --re 27b8b9f0 "on it"
 ~/.dispatch/dispatch-send coord --type report --state done --re T-20260903-02 "[DONE] shipped"
 ~/.dispatch/dispatch-fleet check
@@ -56,6 +56,7 @@ curl -s -H "Authorization: Bearer $TOK" -H 'content-type: application/json' \
 | `state` | `done` `continuing` `waiting` `blocked` | only with `type=report`; a report without `state` is `continuing` |
 | `attachments` | `["/abs/path", …]` or `[{path,size,sha256,name}, …]` | paths only, nothing is uploaded |
 | `force` | boolean | only with `priority=immediate`; makes the recipient's hook deny its next tool call once |
+| `title` | string ≤ 120 | `type=task` only; the task title (fallback: first body line minus a leading `[TAG]`, 80 chars) |
 
 Effects: `type=task` creates a task (title = first non-empty line, ≤ 80 chars; `documents` = attachments; `thread_id` = message id). `type=ack` sets the referenced message `acked` and its task `acked`. `type=report` applies `state` to the task resolved from `task_id` → `re` (task id) → `re` (message with `task_id`) — a report that names no task touches none (no "single open task" fallback; it only counts as "reported this turn"); `done` closes it with the body as `result`; a referenced message becomes `closed` (done) or `answered`. Any non-ack, non-report reply to a `question`/`request_permission` marks it `answered`. Acking a `report` (or an `ack`) is refused with 400.
 
@@ -110,9 +111,12 @@ SSE feed of `task_*` and `message_created` events, filtered to the caller (direc
 Python 3 stdlib only (they also run inside hooks on a 2 s budget). `dispatchlib.py` is shared.
 
 ```
-dispatch-send <to|all> [--type T] [--priority P] [--ack yes|no|auto]
-              [--re <id>] [--task <T-id>] [--state S] [--attach <path>]...
-              [--force] [--json] "<body>"
+dispatch-send <to|all> [--type T] [--title "<task title>"] [--priority P]
+              [--ack yes|no|auto] [--re <id>] [--task <T-id>] [--state S]
+              [--attach <path>]... [--force] [--json] "<body>"
+    --title (type=task, recommended): stored as tasks.title and used for the mirror filename
+    slug (Unicode letters kept, so a Chinese title stays readable). Without it: first body
+    line minus a leading [TAG], cut to 80 chars.
     -t/-p/-a short forms; --flag=value accepted; -- ends flags. $PRIORITY=high still honoured.
     Prints "sent -> <to> (id …)" plus task id / ack required / acked / answered, and a
     "hint: <to> is idle (Claude session "<name>") — … SendMessage(to="<name>")" line when the

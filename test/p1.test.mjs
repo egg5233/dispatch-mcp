@@ -360,3 +360,21 @@ test("P2: dashboard login, messages/thread/inbox/tasks/settings/decisions/wake/m
   await api("coord", "GET", "/msg/recv");
   await api("user", "GET", "/msg/recv");
 });
+
+test("task title: explicit --title wins; fallback strips [TASK] tag and cuts at 80; mirror slug keeps CJK", async () => {
+  const a = await send("coord", { to: "dev", body: "[TASK] 把 watcher 改成 fleet.json 派生\n細節…", type: "task", title: "watcher 改由 fleet.json 派生" });
+  const b = await send("coord", { to: "dev", body: "[TASK] [P2] 第一行標題會被拿來當 title，而且超過八十個字的部分會被切掉切掉切掉切掉切掉切掉切掉切掉切掉切掉切掉切掉切掉切掉切掉切掉切掉切掉切掉切掉切掉切掉切掉切掉切掉切掉切掉切掉切掉\n第二行", type: "task" });
+  assert.equal((await send("coord", { to: "dev", body: "x", title: "nope" })).status, 400);
+  const tasks = (await dash("coord", "GET", "/api/tasks")).body.tasks;
+  const ta = tasks.find((t) => t.id === a.body.task_id), tb = tasks.find((t) => t.id === b.body.task_id);
+  assert.equal(ta.title, "watcher 改由 fleet.json 派生");
+  assert.ok(tb.title.startsWith("第一行標題"));
+  assert.equal([...tb.title].length, 80);
+  assert.ok(tb.title.endsWith("…"));
+  const { readdirSync } = await import("node:fs");
+  const files = readdirSync(process.env.DISPATCH_TASKS_DIR);
+  assert.ok(files.includes(`${a.body.task_id}-watcher-改由-fleet-json-派生.md`), files.join(","));
+  await send("dev", { to: "coord", body: "[DONE]", type: "report", state: "done", re: a.body.task_id });
+  await send("dev", { to: "coord", body: "[DONE]", type: "report", state: "done", re: b.body.task_id });
+  await api("dev", "GET", "/msg/recv"); await api("coord", "GET", "/msg/recv");
+});

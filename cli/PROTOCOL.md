@@ -22,6 +22,8 @@
 ```
 ~/.dispatch/dispatch-send <handle|all> [旗標] "<body>"
   --type task|question|request_permission|report|ack|info   (預設 info)
+  --title "<標題>"               type=task 建議必填：存進 tasks.title、當鏡像檔名 slug；
+                                 未給則取 body 第一行去掉 [TASK] 類前綴、截 80 字
   --priority low|medium|high|immediate                      (預設 medium；PRIORITY=high 環境變數仍可用)
   --ack yes|no|auto              auto = priority 為 high/immediate 時必須 ack (預設 no)
   --re <msg id | task id>        回覆/ack/report 對象
@@ -37,7 +39,7 @@
 
 | type | 用途 | 收到後你該做什麼 |
 |---|---|---|
-| `task` | 指派工作；伺服器自動建 `tasks` 列，id `T-YYYYMMDD-NN` | 需要 ack 時先 ack（見旗標 `[ACK!]`），做完/卡住用 `report` 回 |
+| `task` | 指派工作（建議帶 `--title`）；伺服器自動建 `tasks` 列，id `T-YYYYMMDD-NN`，鏡像檔 `coordination/tasks/T-YYYYMMDD-NN-<title slug>.md` | 需要 ack 時先 ack（見旗標 `[ACK!]`），做完/卡住用 `report` 回 |
 | `question` | 要你回答 | 用任何 type 帶 `--re <id>` 回，該問題自動標 answered |
 | `request_permission` | 要人/coord 決定 GO/NO-GO | 同上，`--re` 回 |
 | `report` | 進度回報（`--state` 必帶，預設 continuing） | **永遠不要 ack 一則 report**（伺服器會拒） |

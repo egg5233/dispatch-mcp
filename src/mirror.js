@@ -11,14 +11,15 @@ import { toDisplayTz } from "./tz.js";
 export const TASKS_DIR =
   process.env.DISPATCH_TASKS_DIR || "/var/solana/data/pearl_workspace/coordination/tasks";
 
+// Unicode-aware slug: letters and digits of any script survive (a Chinese
+// title stays readable), everything else collapses to "-", ≤ 40 code points.
 function slug(title) {
   const s = String(title || "")
     .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 40)
-    .replace(/-+$/g, "");
-  return s;
+    .replace(/…/g, "")
+    .replace(/[^\p{L}\p{N}]+/gu, "-")
+    .replace(/^-+|-+$/g, "");
+  return [...s].slice(0, 40).join("").replace(/-+$/g, "");
 }
 
 function yamlStr(v) {

@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """Send a dispatch message.
 
-usage: dispatch-send <to|all> [--type T] [--priority P] [--ack yes|no|auto]
-                     [--re <id>] [--task <T-id>] [--state S] [--attach <path>]...
-                     [--force] [--json] "<body>"
+usage: dispatch-send <to|all> [--type T] [--title "<task title>"] [--priority P]
+                     [--ack yes|no|auto] [--re <id>] [--task <T-id>] [--state S]
+                     [--attach <path>]... [--force] [--json] "<body>"
+
+--title (type=task, recommended): the task's title as stored in the tasks table
+and used for the coordination/tasks/T-…-<slug>.md mirror filename. Without it
+the first body line is used, minus a leading [TASK]-style tag, cut to 80 chars.
 
 No flags = type info, priority medium. $PRIORITY=high is still honoured as a
 legacy default. Body is everything that is not a flag (joined with spaces),
@@ -26,7 +30,8 @@ def main(argv):
     to = argv[0]
     args = argv[1:]
     opts = {"type": "info", "priority": os.environ.get("PRIORITY") or "medium", "ack": "no",
-            "re": None, "task": None, "state": None, "attach": [], "force": False, "json": False}
+            "re": None, "task": None, "state": None, "attach": [], "force": False, "json": False,
+            "title": None}
     body_parts = []
     i = 0
     while i < len(args):
@@ -44,6 +49,8 @@ def main(argv):
             continue
         if a in ("--type", "-t"):
             opts["type"] = val()
+        elif a == "--title":
+            opts["title"] = val()
         elif a in ("--priority", "-p"):
             opts["priority"] = val()
         elif a == "--ack":
@@ -87,6 +94,10 @@ def main(argv):
         D.die("dispatch-send: --state only makes sense with --type report", 2)
     if opts["force"] and pri != "immediate":
         D.die("dispatch-send: --force requires --priority immediate", 2)
+    if opts["title"] and opts["type"] != "task":
+        D.die("dispatch-send: --title only makes sense with --type task", 2)
+    if opts["type"] == "task" and not opts["title"]:
+        print("dispatch-send: note: no --title given; the task title will be the first body line (minus a [TASK] tag, 80 chars)", file=sys.stderr)
     n = len(body)
     if n > 1500:
         D.die("dispatch-send: body is %d chars (limit 1500). Put the detail in a file and pass --attach <path>." % n, 2)
@@ -116,6 +127,7 @@ def main(argv):
         "state": opts["state"],
         "attachments": attachments,
         "force": opts["force"],
+        "title": opts["title"],
     }
     try:
         status, d = D.http("POST", "/msg/send", payload, token=tok, timeout=10)

@@ -48,7 +48,21 @@ import {
   REPORT_STATES,
   PRESENCE_STATES,
   BODY_MAX_CHARS,
+  recordDelivery,
+  deliveriesFor,
+  recentDeliveries,
+  listMessages,
+  threadFor,
+  openRequests,
+  listAllTasks,
+  taskHealth,
+  getSetting,
+  setSetting,
 } from "./store.js";
+import { writeTaskMirror, TASKS_DIR } from "./mirror.js";
+import { execFile } from "child_process";
+import { readFileSync as readFileSyncFs } from "fs";
+import { homedir } from "os";
 import db from "./store.js";
 import { localizeMessages, toDisplayTz, utcNow } from "./tz.js";
 import {
@@ -470,6 +484,7 @@ function createMcpServer(identity) {
         return { content: [{ type: "text", text: `Error: ${result.error}` }] };
       }
       emitTaskEvent("task_claimed", result, identity);
+      mirrorTask(id);
       return {
         content: [{ type: "text", text: JSON.stringify(taskResponse(result), null, 2) }],
       };
@@ -538,6 +553,7 @@ function createMcpServer(identity) {
       }
       const task = completeTask(id, result);
       emitTaskEvent("task_completed", task, identity);
+      mirrorTask(id);
       return {
         content: [{ type: "text", text: JSON.stringify(taskResponse(task), null, 2) }],
       };
@@ -554,6 +570,7 @@ function createMcpServer(identity) {
     async ({ id }) => {
       const task = cancelTask(id);
       emitTaskEvent("task_cancelled", task, identity);
+      mirrorTask(id);
       return {
         content: [{ type: "text", text: JSON.stringify(taskResponse(task), null, 2) }],
       };
@@ -1017,6 +1034,7 @@ function handleSend(identity, payload) {
   }
 
   emitMessageEvent(message, identity);
+  if (message.task_id) mirrorTask(message.task_id);
   return {
     status: 200,
     body: {
@@ -1230,6 +1248,210 @@ app.get("/msg/:id", (req, res) => {
   const out = localizeMessages([getMessage(m.id)])[0];
   if (m.task_id) out.task = getTask(m.task_id) || null;
   res.json(out);
+});
+
+// ── P2: task mirror + dashboard helpers ────────────────────────────
+
+function thresholds() {
+  return {
+    staleHours: parseFloat(getSetting("task_stale_hours") || "4") || 4,
+    maxContinuing: parseInt(getSetting("task_max_continuing") || "5", 10) || 5,
+  };
+}
+
+function mirrorTask(taskId) {
+  try {
+    const t = getTask(taskId);
+    if (!t) return null;
+    const health = taskHealth(t, thresholds());
+    const thread = t.thread_id ? threadFor(t.thread_id) : null;
+    const path = writeTaskMirror(t, health, thread);
+    dispatchEvents.emit("task", { type: "task_mirrored", task: { id: t.id, status: t.status }, actor: "server", recipients: [], timestamp: new Date().toISOString(), path });
+    return path;
+  } catch (e) {
+    console.error(`[mirror] ${taskId}: ${e.message}`);
+    return null;
+  }
+}
+
+// Delivery / wake records — POSTed by hook.sh, the watcher and the CLI.
+app.post("/wake", express.json(), (req, res) => {
+  const identity = httpIdentity(req, res);
+  if (!identity) return;
+  const b = req.body || {};
+  const method = String(b.method || "");
+  const METHODS = ["hook", "wait-rewake", "keystroke", "blocked", "native-hint", "recv"];
+  if (!METHODS.includes(method)) return res.status(400).json({ error: `method must be one of ${METHODS.join("|")}` });
+  const ids = Array.isArray(b.message_ids) ? b.message_ids.map(String).slice(0, 50) : [];
+  const handle = b.handle && identity !== b.handle ? String(b.handle) : identity; // a sender may record a hint for its recipient
+  const n = recordDelivery(handle, method, ids, b.detail ? String(b.detail).slice(0, 300) : null);
+  dispatchEvents.emit("task", { type: "delivery", delivery: { handle, method, message_ids: ids, detail: b.detail || null }, actor: "server", recipients: [], timestamp: new Date().toISOString() });
+  res.json({ ok: true, recorded: n });
+});
+
+// ── P2: dashboard JSON API (JWT cookie) ────────────────────────────
+
+function withDeliveries(msgs) {
+  return msgs.map((m) => ({ ...m, created_at_display: toDisplayTz(m.created_at), deliveries: deliveriesFor(m.id) }));
+}
+
+app.get("/api/messages", requireJwt, (req, res) => {
+  const q = req.query;
+  const rows = listMessages({
+    from: q.from || null, to: q.to || null, type: q.type || null,
+    priority: q.priority ? normalizePriority(q.priority) : null, status: q.status || null,
+    task: q.task || null, since: q.since || null, until: q.until || null, q: q.q || null,
+    limit: parseInt(q.limit || "200", 10) || 200,
+  });
+  res.json({ count: rows.length, messages: withDeliveries(rows) });
+});
+
+app.get("/api/messages/:id", requireJwt, (req, res) => {
+  const m = getMessage(req.params.id);
+  if (!m) return res.status(404).json({ error: "not found" });
+  res.json(withDeliveries([m])[0]);
+});
+
+app.get("/api/messages/:id/thread", requireJwt, (req, res) => {
+  const t = threadFor(req.params.id);
+  if (!t) return res.status(404).json({ error: "not found" });
+  res.json({ ...t, messages: withDeliveries(t.messages), task: t.task_id ? getTask(t.task_id) : null });
+});
+
+app.get("/api/inbox", requireJwt, (req, res) => {
+  const presence = new Map(getPresence().map((p) => [p.user, p]));
+  const rows = listUsers().map((u) => {
+    const d = inboxDepth(u.handle);
+    const p = presence.get(u.handle);
+    const unacked = unackedRequiredFor(u.handle);
+    const open = getOpenTasksFor(u.handle);
+    return {
+      handle: u.handle, last_seen_at: toDisplayTz(u.last_seen_at),
+      state: p?.state || null, state_at: toDisplayTz(p?.state_at || null), session: p?.session || null,
+      unread: d.n || 0, unread_high_plus: d.high_plus || 0,
+      oldest_unread_at: toDisplayTz(d.oldest), oldest_unread_age_s: d.oldest ? Math.round((Date.now() - new Date(d.oldest.replace(" ", "T") + "Z").getTime()) / 1000) : null,
+      unacked_messages: unacked.map((m) => m.id),
+      open_tasks: open.map((t) => t.id),
+      unacked_tasks: open.filter((t) => t.ack_required && !t.acked_at).map((t) => t.id),
+    };
+  });
+  res.json({ server_time: toDisplayTz(utcNow()), handles: rows });
+});
+
+// Fleet health = the CLI's `dispatch-fleet check --json` (so the page and the
+// CLI cannot disagree) merged with live presence. Cached for 5 s.
+let fleetCache = { at: 0, data: null };
+function fleetCheck(cb) {
+  if (Date.now() - fleetCache.at < 5000 && fleetCache.data) return cb(fleetCache.data);
+  const cli = process.env.DISPATCH_FLEET_CLI || `${homedir()}/.dispatch/dispatch-fleet`;
+  let tmpdir = process.env.TMUX_TMPDIR;
+  try {
+    const f = JSON.parse(readFileSyncFs(`${homedir()}/.dispatch/fleet.json`, "utf8"));
+    tmpdir = tmpdir || f.tmux_tmpdir;
+  } catch { /* no fleet.json */ }
+  const env = { ...process.env, DISPATCH_URL: `http://127.0.0.1:${PORT}` };
+  if (tmpdir) env.TMUX_TMPDIR = tmpdir;
+  execFile("python3", [cli, "check", "--json"], { env, timeout: 20000, maxBuffer: 4 << 20 }, (err, out) => {
+    let data;
+    try { data = JSON.parse(out); } catch { data = { server_error: err ? err.message : "bad output", rows: [] }; }
+    data.checked_at = toDisplayTz(utcNow());
+    fleetCache = { at: Date.now(), data };
+    cb(data);
+  });
+}
+
+app.get("/api/fleet", requireJwt, (req, res) => {
+  fleetCheck((data) => {
+    const presence = new Map(getPresence().map((p) => [p.user, p]));
+    const rows = (data.rows || []).map((r) => {
+      const p = presence.get(r.handle);
+      return { ...r, presence_state: p?.state || null, presence_at: toDisplayTz(p?.state_at || null), presence_session: p?.session || null };
+    });
+    res.json({ ...data, rows });
+  });
+});
+
+app.get("/api/tasks", requireJwt, (req, res) => {
+  const th = thresholds();
+  const tasks = listAllTasks(parseInt(req.query.limit || "300", 10) || 300).map((t) => ({
+    ...t, health: taskHealth(t, th),
+    created_at_display: toDisplayTz(t.created_at), updated_at_display: toDisplayTz(t.updated_at), acked_at_display: toDisplayTz(t.acked_at),
+  }));
+  res.json({ thresholds: th, tasks });
+});
+
+app.get("/api/settings", requireJwt, (req, res) => {
+  res.json({ task_stale_hours: thresholds().staleHours, task_max_continuing: thresholds().maxContinuing, tasks_dir: TASKS_DIR });
+});
+
+app.post("/api/settings", requireJwt, express.json(), (req, res) => {
+  const b = req.body || {};
+  if (b.task_stale_hours !== undefined) {
+    const v = parseFloat(b.task_stale_hours);
+    if (!(v > 0 && v < 1000)) return res.status(400).json({ error: "task_stale_hours must be 0 < h < 1000" });
+    setSetting("task_stale_hours", String(v));
+  }
+  if (b.task_max_continuing !== undefined) {
+    const v = parseInt(b.task_max_continuing, 10);
+    if (!(v > 0 && v < 1000)) return res.status(400).json({ error: "task_max_continuing must be 0 < n < 1000" });
+    setSetting("task_max_continuing", String(v));
+  }
+  res.json({ ok: true, task_stale_hours: thresholds().staleHours, task_max_continuing: thresholds().maxContinuing });
+});
+
+app.get("/api/decisions", requireJwt, (req, res) => {
+  res.json({ requests: withDeliveries(openRequests()) });
+});
+
+// Send a message AS the logged-in dashboard account. Used by the decisions
+// panel (GO / NO-GO with re=<request id>) and the free-form composer. The
+// sender is the JWT subject — a human logs in as the `user` handle, so
+// decisions arrive with from=user. Same validation as the CLI path.
+app.post("/api/send", requireJwt, express.json(), (req, res) => {
+  const r = handleSend(req.user.handle, req.body || {});
+  res.status(r.status).json(r.body);
+});
+
+app.post("/api/decide", requireJwt, express.json(), (req, res) => {
+  const b = req.body || {};
+  const reqMsg = b.re ? getMessage(String(b.re)) : null;
+  if (!reqMsg || reqMsg.type !== "request_permission") return res.status(404).json({ error: "re must be an open request_permission message id" });
+  const decision = String(b.decision || "").toUpperCase();
+  if (!["GO", "NO-GO"].includes(decision)) return res.status(400).json({ error: "decision must be GO or NO-GO" });
+  const note = b.note ? " — " + String(b.note) : "";
+  const r = handleSend(req.user.handle, {
+    to: reqMsg.from_user, re: reqMsg.id, type: "info",
+    priority: normalizePriority(b.priority) || "high",
+    body: `[${decision}] re ${reqMsg.id}${note}`,
+  });
+  res.status(r.status).json(r.body);
+});
+
+app.post("/api/tasks/mirror-all", requireJwt, (req, res) => {
+  const out = [];
+  for (const t of listAllTasks(1000)) if (/^T-\d{8}-\d+$/.test(t.id)) out.push({ id: t.id, path: mirrorTask(t.id) });
+  res.json({ mirrored: out.length, tasks_dir: TASKS_DIR, files: out });
+});
+
+app.get("/api/deliveries", requireJwt, (req, res) => {
+  const since = req.query.since || new Date(Date.now() - 24 * 3600e3).toISOString().replace("T", " ").slice(0, 19);
+  res.json({ since, deliveries: recentDeliveries(since).map((d) => ({ ...d, created_at: toDisplayTz(d.created_at) })) });
+});
+
+// Live event stream for the dashboard — every event, no recipient filter.
+app.get("/api/events", requireJwt, (req, res) => {
+  res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive", "X-Accel-Buffering": "no" });
+  res.write(`: dashboard stream for ${req.user.handle}\n\n`);
+  const heartbeat = setInterval(() => { try { res.write(`: ping ${Date.now()}\n\n`); } catch { /* closed */ } }, 25000);
+  const handler = (event) => {
+    try {
+      const e = { ...event };
+      if (e.message) e.message = { ...e.message, created_at_display: toDisplayTz(e.message.created_at) };
+      res.write(`data: ${JSON.stringify(e)}\n\n`);
+    } catch { /* closed */ }
+  };
+  dispatchEvents.on("task", handler);
+  req.on("close", () => { clearInterval(heartbeat); dispatchEvents.off("task", handler); });
 });
 
 // ── Dashboard auth (JWT cookie) ────────────────────────────────────

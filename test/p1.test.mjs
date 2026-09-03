@@ -36,7 +36,8 @@ before(async () => {
   const port = await freePort();
   base = `http://127.0.0.1:${port}`;
   // create users directly through the store (same DB dir)
-  const env = { ...process.env, DISPATCH_DATA_DIR: dataDir, PORT: String(port) };
+  process.env.DISPATCH_TASKS_DIR = join(dataDir, "tasks");
+  const env = { ...process.env, DISPATCH_DATA_DIR: dataDir, PORT: String(port), DISPATCH_TASKS_DIR: process.env.DISPATCH_TASKS_DIR };
   const setup = spawn(process.execPath, ["--input-type=module", "-e", `
     import { addUser } from "${ROOT}/src/store.js";
     const out = {};
@@ -269,4 +270,92 @@ test("a report without --re/--task never touches a task, even the sender's only 
   assert.ok(!d.open_tasks.find((x) => x.id === t.body.task_id));
   await api("dev", "GET", "/msg/recv");
   await api("coord", "GET", "/msg/recv");
+});
+
+// ── P2 dashboard API ──────────────────────────────────────────────
+async function dash(who, method, path, body) {
+  // JWT cookie login via the users table password; tests set one first.
+  const r = await fetch(base + path, {
+    method, headers: { "content-type": "application/json", cookie: jwtCookie[who] },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  return { status: r.status, body: r.headers.get("content-type")?.includes("json") ? await r.json() : await r.text() };
+}
+const jwtCookie = {};
+
+test("P2: dashboard login, messages/thread/inbox/tasks/settings/decisions/wake/mirror", async () => {
+  // give 'coord' and 'user' dashboard passwords via the store + JWT login
+  const setup = spawn(process.execPath, ["--input-type=module", "-e", `
+    import { addUser, setUserPasswordHash, getUserByHandle } from "${ROOT}/src/store.js";
+    import { hashPassword } from "${ROOT}/src/auth.js";
+    if (!getUserByHandle("user")) addUser("user");
+    setUserPasswordHash("coord", await hashPassword("coordpass1"));
+    setUserPasswordHash("user", await hashPassword("userpass12"));
+    console.log("ok");
+  `], { env: { ...process.env, DISPATCH_DATA_DIR: dataDir }, cwd: ROOT });
+  await new Promise((res) => setup.on("exit", res));
+  for (const [h, pw] of [["coord", "coordpass1"], ["user", "userpass12"]]) {
+    const r = await fetch(base + "/api/login", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ handle: h, password: pw }) });
+    assert.equal(r.status, 200);
+    jwtCookie[h] = r.headers.get("set-cookie").split(";")[0];
+  }
+  // a task thread: task → ack → report continuing → request_permission → decision → done
+  const t = await send("coord", { to: "dev", body: "P2 thread task\ndetails", type: "task", ack: "auto", priority: "high" });
+  const a = await send("dev", { to: "coord", body: "ack", type: "ack", re: t.body.id });
+  await send("dev", { to: "coord", body: "[CONTINUING] wip", type: "report", state: "continuing", re: t.body.task_id });
+  const rp = await send("dev", { to: "user", body: "May I delete X?", type: "request_permission", re: t.body.id });
+  // wake records from the hook / watcher
+  assert.equal((await api("dev", "POST", "/wake", { method: "hook", message_ids: [t.body.id], detail: "Stop-block" })).status, 200);
+  assert.equal((await api("dev", "POST", "/wake", { method: "bogus" })).status, 400);
+  // messages + filters
+  let r = await dash("coord", "GET", "/api/messages?type=task&limit=5");
+  assert.equal(r.status, 200);
+  assert.ok(r.body.messages.some((m) => m.id === t.body.id));
+  assert.equal(r.body.messages.find((m) => m.id === t.body.id).deliveries[0].method, "hook");
+  r = await dash("coord", "GET", `/api/messages/${a.body.id}/thread`);
+  assert.equal(r.body.root_id, t.body.id);
+  assert.equal(r.body.task_id, t.body.task_id);
+  assert.ok(r.body.messages.length >= 4);
+  assert.ok(r.body.messages.some((m) => m.id === rp.body.id));
+  // inbox
+  r = await dash("coord", "GET", "/api/inbox");
+  const dev = r.body.handles.find((h) => h.handle === "dev");
+  assert.ok(dev.unread >= 1);
+  // tasks + health + settings
+  r = await dash("coord", "GET", "/api/tasks");
+  const tk = r.body.tasks.find((x) => x.id === t.body.task_id);
+  assert.equal(tk.status, "in_progress");
+  assert.equal(tk.health.trailing_continuing, 1);
+  assert.equal(tk.health.overdue, false);
+  assert.equal((await dash("coord", "POST", "/api/settings", { task_max_continuing: 1 })).status, 200);
+  r = await dash("coord", "GET", "/api/tasks");
+  assert.equal(r.body.tasks.find((x) => x.id === t.body.task_id).health.overdue, true);
+  assert.equal((await dash("coord", "POST", "/api/settings", { task_stale_hours: -1 })).status, 400);
+  // decisions: GO from the `user` account, arrives as from=user with re=
+  r = await dash("user", "GET", "/api/decisions");
+  assert.ok(r.body.requests.some((m) => m.id === rp.body.id));
+  r = await dash("user", "POST", "/api/decide", { re: rp.body.id, decision: "GO", note: "fine" });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.answered, rp.body.id);
+  const inbox = (await api("dev", "GET", "/msg/recv")).body;
+  const go = inbox.messages.find((m) => m.re === rp.body.id);
+  assert.equal(go.from_user, "user");
+  assert.match(go.body, /^\[GO\]/);
+  assert.equal((await dash("user", "GET", "/api/decisions")).body.requests.some((m) => m.id === rp.body.id), false);
+  assert.equal((await dash("user", "POST", "/api/decide", { re: t.body.id, decision: "GO" })).status, 404);
+  // mirror: a file per task in the temp tasks dir
+  await send("dev", { to: "coord", body: "[DONE] finished", type: "report", state: "done", re: t.body.task_id });
+  const { readdirSync, readFileSync } = await import("node:fs");
+  const files = readdirSync(process.env.DISPATCH_TASKS_DIR).filter((f) => f.startsWith(t.body.task_id));
+  assert.equal(files.length, 1);
+  const md = readFileSync(join(process.env.DISPATCH_TASKS_DIR, files[0]), "utf8");
+  assert.match(md, /^---\ntitle: "P2 thread task"\ntype: "task"\ntask: "T-/);
+  assert.match(md, /status: "closed"/);
+  assert.match(md, /report \[CONTINUING\]/);
+  r = await dash("coord", "POST", "/api/tasks/mirror-all");
+  assert.ok(r.body.mirrored >= 1);
+  // unauthenticated → 401
+  assert.equal((await fetch(base + "/api/messages")).status, 401);
+  await api("coord", "GET", "/msg/recv");
+  await api("user", "GET", "/msg/recv");
 });

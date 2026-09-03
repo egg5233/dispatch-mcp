@@ -147,11 +147,11 @@ def main(argv):
         print(line)
         # Idle-wake hint: if the recipient is a Claude session that is idle,
         # SendMessage is the native way to start its next turn now.
-        wake_hint(to)
+        wake_hint(to, d.get("id"))
     return 0
 
 
-def wake_hint(to):
+def wake_hint(to, msg_id=None):
     if to == "all":
         return
     fleet = D.load_fleet()
@@ -170,6 +170,11 @@ def wake_hint(to):
     s = D.session_for_pane(pane) if pane else None
     if s and s.get("status") == "idle":
         print("  hint: %s is idle (Claude session \"%s\") — to wake it now use SendMessage(to=\"%s\")" % (to, s["name"], s["name"]))
+        try:
+            _, tok = D.identity()
+            D.http("POST", "/wake", {"method": "native-hint", "handle": to, "message_ids": [msg_id] if msg_id else [], "detail": "SendMessage(to=%s) hint printed" % s["name"]}, token=tok, timeout=2)
+        except D.DispatchError:
+            pass
 
 
 if __name__ == "__main__":

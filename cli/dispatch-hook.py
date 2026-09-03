@@ -70,6 +70,14 @@ def presence(tok, state, session_name):
         pass
 
 
+def wake(tok, method, ids, detail=None):
+    """Fire-and-forget delivery record for the dashboard (P2)."""
+    try:
+        D.http("POST", "/wake", {"method": method, "message_ids": list(ids)[:50], "detail": detail}, token=tok, timeout=min(HTTP_TIMEOUT, 1.5))
+    except D.DispatchError:
+        pass
+
+
 def digest(tok, since=None):
     q = "/hook/digest"
     if since:
@@ -195,6 +203,8 @@ def main():
         injected = st.setdefault("injected", {})
         denied = st.setdefault("denied", {})
         first = [m["id"] for m in d["immediate"] if m["id"] not in injected]
+        if first:
+            wake(tok, "hook", first, event + " immediate")
         text = immediate_text(d, set(first))
         for m in d["immediate"]:
             injected[m["id"]] = injected.get(m["id"], 0) + 1
@@ -235,6 +245,7 @@ def main():
         if reason:
             st["blocked_turn"] = turn_start
             save_state(handle, session_id, st)
+            wake(tok, "hook", [i["id"] for i in d["unread"]["items"] if i["priority"] != "low"], "Stop block")
             # Documented block signal for Stop: exit 2, stderr = reason. The JSON
             # form on stdout is kept for older builds that parse it.
             out({"decision": "block", "reason": reason})
@@ -311,6 +322,7 @@ def wait_loop(tok, handle, session_id):
             dg = digest(tok) or {"unread": {"total": d["count"], "by_priority": {}, "items": []}, "open_tasks": []}
             text = digest_text(dg, handle, header="[dispatch wake]") or "[dispatch wake] %d new message(s) — run %s" % (d["count"], RECV_HINT)
             logln("message arrived (%d) -> exit 2" % d["count"])
+            wake(tok, "wait-rewake", [m["id"] for m in d.get("messages") or []], "async Stop hook exit 2")
             sys.stdout.write(text + "\n")
             sys.stderr.write(text + "\n")
             sys.stdout.flush()

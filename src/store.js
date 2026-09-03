@@ -100,6 +100,21 @@ db.exec(`
   -- return simply stays unread on the server. The cursor is kept as a
   -- lower bound so the read set stays small: once a drain returns
   -- everything, the cursor advances and older read rows are pruned.
+  -- Delivery / wake records (dispatch v2 P2). Written by whoever surfaced a
+  -- message: the hook (digest / immediate injection / Stop block), the async
+  -- Wait rewake, the keystroke watcher (fired or blocked), or the CLI when it
+  -- printed the SendMessage hint. Lets the dashboard show HOW a message got
+  -- to its agent, and why it did not.
+  CREATE TABLE IF NOT EXISTS deliveries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id TEXT,
+    handle TEXT NOT NULL,
+    method TEXT NOT NULL,           -- hook | wait-rewake | keystroke | blocked | native-hint | recv
+    detail TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_deliveries_msg ON deliveries (message_id);
+
   CREATE TABLE IF NOT EXISTS message_reads (
     handle TEXT NOT NULL,
     message_id TEXT NOT NULL,
@@ -490,6 +505,31 @@ const stmts = {
   pruneMessages: db.prepare(`
     DELETE FROM messages WHERE created_at < ?
   `),
+  // ── P2 dashboard ──
+  insertDelivery: db.prepare(`
+    INSERT INTO deliveries (message_id, handle, method, detail) VALUES (?, ?, ?, ?)
+  `),
+  deliveriesFor: db.prepare(`
+    SELECT message_id, handle, method, detail, created_at FROM deliveries
+     WHERE message_id = ? ORDER BY created_at ASC, id ASC
+  `),
+  recentDeliveries: db.prepare(`
+    SELECT message_id, handle, method, detail, created_at FROM deliveries
+     WHERE created_at >= ? ORDER BY created_at ASC, id ASC
+  `),
+  childrenOf: db.prepare(`SELECT * FROM messages WHERE re = ? ORDER BY created_at ASC, rowid ASC`),
+  byTask: db.prepare(`SELECT * FROM messages WHERE task_id = ? ORDER BY created_at ASC, rowid ASC`),
+  reportsForTask: db.prepare(`
+    SELECT id, from_user, state, created_at, substr(body, 1, 200) AS summary
+      FROM messages WHERE task_id = ? AND type = 'report'
+     ORDER BY created_at ASC, rowid ASC
+  `),
+  openRequests: db.prepare(`
+    SELECT * FROM messages
+     WHERE type = 'request_permission' AND status IN ('queued', 'delivered')
+     ORDER BY created_at ASC
+  `),
+  allTasksRecent: db.prepare(`SELECT * FROM tasks ORDER BY created_at DESC LIMIT ?`),
 };
 
 // Human-facing task id: T-YYYYMMDD-NN (date in the display zone, NN = per-day
@@ -881,6 +921,111 @@ export function getRecentMessages(handle, limit = 50) {
 export function pruneMessages(cutoff) {
   const info = stmts.pruneMessages.run(cutoff);
   return { messages: info.changes, cutoff };
+}
+
+// ── P2: dashboard queries ─────────────────────────────────────────
+
+export function recordDelivery(handle, method, messageIds = [], detail = null) {
+  const ids = Array.isArray(messageIds) && messageIds.length ? messageIds : [null];
+  const tx = db.transaction(() => {
+    for (const id of ids) stmts.insertDelivery.run(id, handle, method, detail);
+  });
+  tx();
+  return ids.length;
+}
+
+export function deliveriesFor(messageId) {
+  return stmts.deliveriesFor.all(messageId);
+}
+
+export function recentDeliveries(sinceUtc) {
+  return stmts.recentDeliveries.all(sinceUtc);
+}
+
+// Free-form message listing for the dashboard (all messages, not per-identity).
+export function listMessages({ from = null, to = null, type = null, priority = null, status = null,
+  since = null, until = null, q = null, task = null, limit = 200 } = {}) {
+  const where = [];
+  const args = [];
+  if (from) { where.push("from_user = ?"); args.push(from); }
+  if (to) {
+    if (to === "all") where.push("to_user IS NULL");
+    else { where.push("to_user = ?"); args.push(to); }
+  }
+  if (type) { where.push("type = ?"); args.push(type); }
+  if (priority) { where.push("priority = ?"); args.push(priority); }
+  if (status) { where.push("status = ?"); args.push(status); }
+  if (task) { where.push("task_id = ?"); args.push(task); }
+  if (since) { where.push("created_at >= ?"); args.push(since); }
+  if (until) { where.push("created_at <= ?"); args.push(until); }
+  if (q) { where.push("body LIKE ?"); args.push("%" + q + "%"); }
+  const sql = `SELECT * FROM messages${where.length ? " WHERE " + where.join(" AND ") : ""}
+               ORDER BY created_at DESC, rowid DESC LIMIT ?`;
+  args.push(Math.min(2000, Math.max(1, limit)));
+  return parseAttachments(db.prepare(sql).all(...args));
+}
+
+// A thread = the root of the `re` chain plus every descendant, plus every
+// message that carries the same task_id. Bounded walk; ids deduplicated.
+export function threadFor(messageId) {
+  const seen = new Map();
+  let root = stmts.getMessage.get(messageId);
+  if (!root) return null;
+  let guard = 0;
+  while (root.re && guard++ < 50) {
+    const parent = stmts.getMessage.get(root.re);
+    if (!parent) break;
+    root = parent;
+  }
+  const queue = [root];
+  while (queue.length) {
+    const m = queue.shift();
+    if (seen.has(m.id)) continue;
+    seen.set(m.id, m);
+    for (const c of stmts.childrenOf.all(m.id)) queue.push(c);
+    if (m.task_id) for (const t of stmts.byTask.all(m.task_id)) queue.push(t);
+    if (seen.size > 500) break;
+  }
+  const rows = [...seen.values()].sort((a, b) => (a.created_at < b.created_at ? -1 : a.created_at > b.created_at ? 1 : 0));
+  return { root_id: root.id, task_id: root.task_id || rows.find((r) => r.task_id)?.task_id || null, messages: parseAttachments(rows) };
+}
+
+export function reportsForTask(taskId) {
+  return stmts.reportsForTask.all(taskId);
+}
+
+export function openRequests() {
+  return parseAttachments(stmts.openRequests.all());
+}
+
+export function listAllTasks(limit = 300) {
+  return stmts.allTasksRecent.all(limit).map((t) => {
+    try { t.files = JSON.parse(t.files); } catch { t.files = []; }
+    try { t.documents = JSON.parse(t.documents || "[]"); } catch { t.documents = []; }
+    return t;
+  });
+}
+
+// Task timeline + staleness. `staleHours`: hours since the last report (or
+// since creation) after which an active task is flagged; `maxContinuing`:
+// consecutive trailing CONTINUING reports after which it is flagged.
+export function taskHealth(task, { staleHours = 4, maxContinuing = 5 } = {}) {
+  const reports = stmts.reportsForTask.all(task.id);
+  const active = ["open", "acked", "in_progress", "waiting", "blocked", "pushed"].includes(task.status);
+  const last = reports.length ? reports[reports.length - 1] : null;
+  const anchor = last ? last.created_at : task.updated_at || task.created_at;
+  const ageH = (Date.now() - new Date(anchor.replace(" ", "T") + "Z").getTime()) / 3600e3;
+  let trailing = 0;
+  for (let i = reports.length - 1; i >= 0; i--) {
+    if (reports[i].state === "continuing") trailing++;
+    else break;
+  }
+  const flags = [];
+  if (active && ageH >= staleHours) flags.push(`no report for ${ageH.toFixed(1)}h (limit ${staleHours}h)`);
+  if (active && trailing >= maxContinuing) flags.push(`${trailing} consecutive CONTINUING (limit ${maxContinuing})`);
+  if (active && task.ack_required && !task.acked_at) flags.push("ack required, not acked");
+  return { reports, last_report_at: last ? last.created_at : null, hours_since_report: Number(ageH.toFixed(2)),
+           trailing_continuing: trailing, flags, overdue: flags.length > 0 };
 }
 
 export function updatePresence(user, workingOn = null, files = []) {

@@ -114,6 +114,26 @@ function logBlocked(reason) {
   lastBlockReason = reason;
   lastBlockLoggedAt = now;
   console.log(`[${ts()}] blocked: ${reason}`);
+  postWake("blocked", reason);
+}
+
+// Delivery record for the dashboard (dispatch v2 P2): tells the operator
+// whether this watcher typed the prompt or why it refused to. Fire-and-forget.
+const BASE_URL = (URL_STR || "").replace(/\/events\/?$/, "");
+let pendingIds = [];
+function postWake(method, detail) {
+  if (!BASE_URL || !TOKEN) return;
+  try {
+    const u = new URL(BASE_URL + "/wake");
+    const mod = u.protocol === "https:" ? https : http;
+    const body = JSON.stringify({ method, message_ids: pendingIds.slice(0, 50), detail: String(detail || "").slice(0, 300) });
+    const req = mod.request({ host: u.hostname, port: u.port || (u.protocol === "https:" ? 443 : 80), path: u.pathname, method: "POST",
+      headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) }, timeout: 2000 },
+      (res) => res.resume());
+    req.on("error", () => {});
+    req.on("timeout", () => req.destroy());
+    req.end(body);
+  } catch { /* never let telemetry break the watcher */ }
 }
 function clearBlocked() {
   lastBlockReason = "";
@@ -302,7 +322,7 @@ function pokeTmux() {
     setTimeout(() => {
       execFile(TMUX_BIN, ["send-keys", "-t", TMUX_TARGET, "Enter"], (e2) => {
         if (e2) console.error(`[${ts()}] tmux send-keys (Enter) failed: ${e2.message}`);
-        else console.log(`[${ts()}] fired "${PROMPT}" → ${TMUX_TARGET}  (${label})`);
+        else { console.log(`[${ts()}] fired "${PROMPT}" → ${TMUX_TARGET}  (${label})`); postWake("keystroke", label); pendingIds = []; }
       });
     }, 200);
   });
@@ -337,6 +357,7 @@ function handleEvent(event) {
     }
   }
   lastLabel = `${event.type} #${id} from ${event.actor || "?"}`;
+  if (event.message?.id && !pendingIds.includes(event.message.id)) pendingIds.push(event.message.id);
   wakePending = true;
   console.log(`[${ts()}] wake pending (idle-gated): ${lastLabel}`);
 }

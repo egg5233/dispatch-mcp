@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # dispatch-init-project — create a project's coordination/ from the template and register it with dispatch.
 #
-#   dispatch-init-project <name> --workspace <dir> [--coordinator <handle>] [--dry-run] [--no-launch]
+#   dispatch-init-project <name> --workspace <dir> [--coordinator <handle>] [--cmd "<launch cmd>"] [--dry-run] [--no-launch]
 #
 # Steps (each skipped when already done, so re-running is safe):
 #   1 validate name ([a-z0-9-]) and workspace dir
@@ -11,6 +11,7 @@
 #   4 dispatch-fleet project add <name> --dir <dir>/coordination --session <name> --coordinator <handle>
 #   5 tmux session <name> (create if missing, -c <dir>)
 #   6 dispatch-fleet add <handle> --project <name> --cwd <dir>/coordination --runtime claude --session <name> --window coord
+#     --cmd "claude --dangerously-skip-permissions" (the fleet's launch command; unattended agents cannot answer permission dialogs)
 # Template location: $DISPATCH_REPO/templates/coordination, else the checkout this script lives in,
 # else fleet.json "repo", else /var/solana/data/dispatch-mcp.
 set -euo pipefail
@@ -19,13 +20,15 @@ usage() { sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-1}"; }
 die() { echo "dispatch-init-project: $*" >&2; exit 1; }
 say() { echo "[$1]$([ "$DRY" = 1 ] && echo " (dry-run)") $2"; }
 
-NAME=""; WS=""; COORD=""; DRY=0; LAUNCH=1
+NAME=""; WS=""; COORD=""; DRY=0; LAUNCH=1; CMD="claude --dangerously-skip-permissions"
 while [ $# -gt 0 ]; do
   case "$1" in
     --workspace|-w) WS="${2:-}"; shift 2 ;;
     --workspace=*) WS="${1#*=}"; shift ;;
     --coordinator|-c) COORD="${2:-}"; shift 2 ;;
     --coordinator=*) COORD="${1#*=}"; shift ;;
+    --cmd) CMD="${2:-}"; shift 2 ;;
+    --cmd=*) CMD="${1#*=}"; shift ;;
     --dry-run) DRY=1; shift ;;
     --no-launch) LAUNCH=0; shift ;;
     -h|--help) usage 0 ;;
@@ -96,10 +99,10 @@ if tmux has-session -t "=$NAME" 2>/dev/null; then say tmux "session exists: $NAM
 else run tmux new-session -d -s "$NAME" -c "$WS" && say tmux "created session $NAME (cwd $WS)"; fi
 
 # --- 6 coordinator -----------------------------------------------------------------------------
-if [ "$LAUNCH" = 0 ]; then say coordinator "skipped (--no-launch); run: $FLEET add $COORD --project $NAME --cwd $CDIR --runtime claude --session $NAME --window coord"
+if [ "$LAUNCH" = 0 ]; then say coordinator "skipped (--no-launch); run: $FLEET add $COORD --project $NAME --cwd $CDIR --runtime claude --session $NAME --window coord --cmd \"$CMD\""
 elif python3 -c 'import json,sys;sys.exit(0 if sys.argv[2] in json.load(open(sys.argv[1]))["handles"] else 1)' "$DISPATCH_HOME/fleet.json" "$COORD" 2>/dev/null; then say coordinator "already in fleet.json: $COORD"
-else run "$FLEET" add "$COORD" --project "$NAME" --cwd "$CDIR" --runtime claude --session "$NAME" --window coord && say coordinator "launched + registered $COORD"; fi
+else run "$FLEET" add "$COORD" --project "$NAME" --cwd "$CDIR" --runtime claude --session "$NAME" --window coord --cmd "$CMD" && say coordinator "launched + registered $COORD"; fi
 
 echo
-echo "next: $FLEET check   |   add agents: $FLEET add $NAME-<role> --project $NAME --cwd <dir> --runtime claude|codex"
+echo "next: $FLEET check   |   add agents: $FLEET add $NAME-<role> --project $NAME --cwd <dir> --runtime claude|codex --cmd \"$CMD\""
 echo "      runbook: $REPO/docs/runbooks/onboard-new-project.md"

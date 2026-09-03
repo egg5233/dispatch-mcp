@@ -58,9 +58,9 @@ What it does, in order (each step is skipped if already done, so the command is 
 3. `git init` in `<dir>/coordination` (if not a repo) and a first commit.
 4. `dispatch-fleet project add <name> --dir <dir>/coordination --session <name> --coordinator <handle>` — registers the project so task mirrors land in this directory and `coord` resolves to this coordinator.
 5. Creates the tmux session `<name>` if it does not exist (`tmux new-session -d -s <name> -c <dir>`).
-6. `dispatch-fleet add <handle> --project <name> --cwd <dir>/coordination --runtime claude --session <name> --window coord` — opens a window in the project session, launches Claude in the coordination dir, mints the token, registers pane + token in `fleet.json`, starts the watcher, waits for the `❯` prompt (the trust dialog is answered by the tool).
+6. `dispatch-fleet add <handle> --project <name> --cwd <dir>/coordination --runtime claude --session <name> --window coord --cmd "claude --dangerously-skip-permissions"` — opens a window in the project session, launches Claude in the coordination dir, mints the token, registers pane + token in `fleet.json`, starts the watcher, waits for the `❯` prompt (the trust dialog is answered by the tool). `--cmd` on the init script overrides the launch command.
 
-`--dry-run` prints the plan without doing anything. `--no-launch` stops after step 4 (use it when the coordinator will run somewhere unusual).
+`--dry-run` prints the plan without doing anything. `--no-launch` stops after step 5 (use it when the coordinator will run somewhere unusual). `--cmd "<launch cmd>"` changes how the coordinator is started.
 
 Manual equivalent (only if the script is unavailable): the six steps above, in that order, with the same commands.
 
@@ -80,22 +80,16 @@ For each agent the project needs:
 
 ```bash
 ~/.dispatch/dispatch-fleet add <name>-<role> --project <name> --cwd <repo-or-worktree> \
-    --runtime claude|codex [--session <name>] [--window <role>]
+    --runtime claude|codex --cmd "claude --dangerously-skip-permissions" [--session <name>] [--window <role>]
 ```
 
 This creates the window, launches the runtime in `--cwd`, registers the pane and token, starts the `watch-<handle>` pm2 watcher, and for Claude waits until the prompt is ready. Handles are global: `<name>-<role>` avoids collisions with other projects' agents.
 
-**Registering a pane that already exists** (an agent the user started by hand):
+**Registering a pane that already exists** (an agent the user started by hand, or a shell where the agent should live):
 
-1. Look before typing: `tmux display -p -t %N '#{session_name}:#{window_index} #{pane_current_command} #{pane_current_path}'`. The foreground command must be the runtime (`claude`, or `node` for Codex). If it is a shell (`bash`), the pane is idle at a prompt: check nobody is typing there (`#{session_activity}` older than a minute), then start the runtime the way the rest of the fleet runs it, from the directory the agent should work in:
-
-   ```bash
-   tmux send-keys -t %N 'cd <repo> && claude --dangerously-skip-permissions' Enter
-   ```
-
-   Wait for the `❯` prompt (a first launch in a new directory shows the trust dialog; answer it). The guards refuse to type into a shell pane on purpose, and `check` reports `pane_cmd=bash` until the runtime is up.
-2. Register the pane instead of creating a window: the `add` form that takes an existing pane (`--pane %N`; see `dispatch-fleet --help`).
-3. `dispatch-fleet check` must show the handle with `match=yes` and its watcher `online`.
+1. Look before typing: `tmux display -p -t %N '#{session_name}:#{window_index} #{pane_current_command} #{pane_current_path}'`. The pane must be either the runtime already (`claude`, or `node` for Codex) or an idle shell (`bash`/`zsh`); `add` refuses anything else. If it is a shell, check nobody is typing there (`#{session_activity}` older than a minute).
+2. Register it: `dispatch-fleet add <name>-<role> --project <name> --pane %N [--cwd <dir>] --cmd "claude --dangerously-skip-permissions"`. With a shell in the pane, `add` runs `cd <cwd> && <cmd>` there itself (cwd defaults to the pane's current path), waits for the `❯` prompt and answers the trust dialog; with the runtime already running it only registers. Pass `--cmd` explicitly: the default launch is bare `claude`, and an unattended agent must run with `--dangerously-skip-permissions` (the whole fleet does) or its first permission dialog stalls it — hooks and the watcher cannot answer dialogs.
+3. `dispatch-fleet check` must show the handle with `match=yes`, its project, and the watcher `online`.
 
 Each agent's own `CLAUDE.md` (in its repo, not in coordination/) needs only: the project name, the path of the coordination dir, and "read `~/.dispatch/PROTOCOL.md`". The report-to-coord rule is global. If the repo is not yours to commit to, put those lines in `CLAUDE.local.md` next to it (Claude Code reads it, git ignores it).
 

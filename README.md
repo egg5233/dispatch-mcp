@@ -206,6 +206,8 @@ dispatch-fleet check                                                            
 
 Offboarding: `dispatch-fleet remove <handle> --watcher` for each handle (clears its server-side project), then `dispatch-fleet project remove <name>`.
 
+`templates/coordination/` is the `coordination/` directory template (taxonomy, generic README, STATUS board, coordinator `CLAUDE.md`, `.gitignore`); `dispatch-init-project <name> --workspace <dir>` copies it, `git init`s it, runs `project add`, creates the tmux session and launches the coordinator with `dispatch-fleet add` — the runbook's §1 in one re-runnable command.
+
 ## Claude Code hooks (`cli/hook.sh` → `dispatch-hook.py`)
 
 | event | what the hook does |
@@ -259,10 +261,6 @@ Codex CLI 0.148.0 ships lifecycle hooks (`codex features list` → `hooks stable
 ## Installing the CLI to `~/.dispatch`
 
 `deploy/install-cli.sh` copies `cli/*` into `~/.dispatch` (idempotent; `--check` only reports drift). Run it after every pull that touches `cli/` — the hook and CLI run from `~/.dispatch`, not from the checkout, and a forgotten copy once left the hook without its delivery-record code for hours.
-
-## Projects (several projects on one server)
-
-Each project has its own coordinator, agents, tmux session and `coordination/` directory; server, CLI, hooks and dashboard are shared. `templates/coordination/` is the directory template (taxonomy, generic README, STATUS board, coordinator `CLAUDE.md`, `.gitignore`); `cli/dispatch-init-project <name> --workspace <dir>` copies it, `git init`s it, registers the project and launches the coordinator; `docs/runbooks/onboard-new-project.md` is the runbook (prerequisites, init, adding agents, verification, remote hosts, offboarding, troubleshooting). Naming: tmux session = project name, coordinator `coord-<project>`, agents `<project>-<role>`; every agent addresses its own coordinator as `coord`.
 
 ## Tests
 

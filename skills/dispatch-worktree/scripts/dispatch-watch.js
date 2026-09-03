@@ -67,7 +67,7 @@ const HUMAN_IDLE_MS = parseInt(process.env.DISPATCH_HUMAN_IDLE_MS || "8000", 10)
 // Composer placeholders that LOOK like residual text but are not. codex
 // renders a grey hint after its `\u203a` prompt; treat those as empty.
 const PLACEHOLDERS = (process.env.DISPATCH_PLACEHOLDERS ||
-  "Write tests for @filename").split("|").map((x) => x.trim()).filter(Boolean);
+  "Write tests for @filename|Ask Codex to do anything").split("|").map((x) => x.trim()).filter(Boolean);
 // Escape hatch: DISPATCH_GUARDS_OFF=1 restores pre-v2 behaviour.
 const GUARDS_OFF = process.env.DISPATCH_GUARDS_OFF === "1";
 
@@ -106,20 +106,30 @@ function clearBlocked() {
 // Strip box-drawing/decoration so we can tell an empty composer from a
 // half-typed one. Keeps it deliberately crude — this guard is best-effort.
 function composerResidue(capture) {
+  // The reliable discriminator is STYLING, not text: every TUI here renders
+  // its composer hint with SGR 2 (faint), while text a human actually typed
+  // carries no dim attribute. Measured 2026-09-03 on live panes:
+  //   %6 codex   \x1b[2mAsk Codex to do anything\x1b[0m     placeholder
+  //   %5 codex   \x1b[2mWrite tests for @filename\x1b[0m    placeholder
+  //   %9 claude  \x1b[39m\u276f <half-typed line>           real input
+  // A literal hint list loses, because codex rotates the hint.
+  // REQUIRES a capture taken with `capture-pane -e` so escapes survive.
   const lines = capture.split("\n");
   for (let i = lines.length - 1; i >= 0; i--) {
-    const line = lines[i];
-    const m = /[\u276f\u203a>][ \u00a0]?(.*)$/.exec(line);
+    const raw = lines[i];
+    const undimmed = raw.replace(/\x1b\[2m[\s\S]*?\x1b\[0m/g, "");
+    const plain = undimmed.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, "");
+    const m = /[\u276f\u203a>][ \u00a0]?(.*)$/.exec(plain);
     if (!m) continue;
     let rest = m[1]
-      .replace(/[\u2500-\u257f]/g, "")   // box drawing
+      .replace(/[\u2500-\u257f]/g, "")
       .replace(/[\u00a0\s]/g, " ")
       .trim();
     if (!rest) return "";
     if (PLACEHOLDERS.some((ph) => rest === ph || rest.startsWith(ph))) return "";
     return rest;
   }
-  return ""; // no prompt marker found -> cannot tell -> treat as empty
+  return "";
 }
 
 function die(msg) {
@@ -241,13 +251,17 @@ function checkGuards(cb) {
             if (String(cap).includes(BUSY_MARKER)) {
               return cb(false, "agent busy (interrupt hint visible)");
             }
-            if (!GUARDS_OFF) {
-              const residue = composerResidue(String(cap));
+            if (GUARDS_OFF) return cb(true, "");
+            // Guard C needs -e: the plain capture drops the dim attribute
+            // that distinguishes a placeholder from half-typed input.
+            execFile(TMUX_BIN, ["capture-pane", "-p", "-e", "-t", TMUX_TARGET], (e4, capE) => {
+              if (e4) return cb(false, `capture-pane -e failed: ${e4.message}`);
+              const residue = composerResidue(String(capE));
               if (residue) {
                 return cb(false, `composer not empty: ${JSON.stringify(residue.slice(0, 40))}`);
               }
-            }
-            cb(true, "");
+              cb(true, "");
+            });
           });
         });
     }

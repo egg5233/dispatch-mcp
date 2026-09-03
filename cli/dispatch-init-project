@@ -78,15 +78,17 @@ done < <(find "$TPL" -type f -print0 | sort -z)
 say template "$([ "$DRY" = 1 ] && echo would copy || echo copied) $copied file(s), kept $kept existing"
 
 # --- 3 git -------------------------------------------------------------------------------------
+FIRST=0
 if [ -d "$CDIR/.git" ]; then say git "already a repo: $CDIR"
-else
+else FIRST=1
   run git -C "$CDIR" init -q -b main 2>/dev/null || run git -C "$CDIR" init -q
   say git "initialized $CDIR"
 fi
 if [ "$DRY" = 0 ]; then
   git -C "$CDIR" add -A
   if ! git -C "$CDIR" diff --cached --quiet; then
-    git -C "$CDIR" commit -q -m "init coordination/ for $NAME from dispatch-mcp templates/coordination" && say git "first commit $(git -C "$CDIR" rev-parse --short HEAD)"
+    if [ "$FIRST" = 1 ]; then msg="init coordination/ for $NAME from dispatch-mcp templates/coordination"; else msg="coordination/ for $NAME: add template files missing from the earlier copy"; fi
+    git -C "$CDIR" commit -q -m "$msg" && say git "$([ "$FIRST" = 1 ] && echo first || echo new) commit $(git -C "$CDIR" rev-parse --short HEAD)"
   else say git "nothing to commit"; fi
 else say git "would add + commit"; fi
 

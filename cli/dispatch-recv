@@ -14,7 +14,8 @@ usage: dispatch-recv [--limit N] [--priority high+] [--all] [--since <id>]
                    says what was held back and how to see it)
   --since <id>     show everything after message <id> (non-destructive)
   --full           show full bodies instead of one-liners for this drain
-  --full <ids>     print those messages in full (no drain; comma-separated)
+  --full <ids>     print those messages in full (comma-separated); marks them read
+                   unless --peek is also given
   --peek           look without consuming (hooks use this; you rarely need it)
   --json           raw JSON instead of text
 
@@ -118,7 +119,7 @@ def main(argv):
         rc = 0
         for mid in o["full_ids"]:
             try:
-                status, d = D.http("GET", "/msg/" + mid, token=tok)
+                status, d = D.http("GET", "/msg/%s%s" % (mid, "" if o["peek"] else "?read=1"), token=tok)
             except D.DispatchError as e:
                 # fall back to the local spool
                 rows = [m for m in D.spool_read(handle) if m.get("id") == mid]

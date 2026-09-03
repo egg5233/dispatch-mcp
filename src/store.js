@@ -843,6 +843,16 @@ export function pullUnreadMessages(handle, { minPriority = "low", limit = 0 } = 
   return tx();
 }
 
+// Mark one message read for `handle` (used by GET /msg/:id?read=1 so that
+// reading a message in full also clears it from the unread set).
+export function markMessageRead(handle, id) {
+  const m = stmts.getMessage.get(id);
+  if (!m || m.from_user === handle || (m.to_user && m.to_user !== handle)) return false;
+  stmts.markRead.run(handle, id);
+  stmts.markDelivered.run(id);
+  return true;
+}
+
 export function setMessageStatus(id, status) {
   stmts.setMessageStatus.run(status, status, status, id);
   return getMessage(id);

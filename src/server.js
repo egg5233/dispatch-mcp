@@ -30,6 +30,7 @@ import {
   countUnread,
   getMessage,
   setMessageStatus,
+  markMessageRead,
   messageHistoryAfter,
   lastReportAt,
   unackedRequiredFor,
@@ -1225,7 +1226,9 @@ app.get("/msg/:id", (req, res) => {
   if (m.to_user && m.to_user !== identity && m.from_user !== identity) {
     return res.status(403).json({ error: "not a party to this message" });
   }
-  const out = localizeMessages([m])[0];
+  // ?read=1: reading it in full counts as reading it (dispatch-recv --full).
+  if (req.query.read === "1" || req.query.read === "true") markMessageRead(identity, m.id);
+  const out = localizeMessages([getMessage(m.id)])[0];
   if (m.task_id) out.task = getTask(m.task_id) || null;
   res.json(out);
 });

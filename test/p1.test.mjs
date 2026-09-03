@@ -244,3 +244,15 @@ test("legacy client shape still works (no type/ack fields)", async () => {
   assert.equal(d.messages[0].ack, "no");
   assert.match(d.messages[0].created_at, /\+08$/);
 });
+
+test("GET /msg/:id?read=1 marks the message read (dispatch-recv --full)", async () => {
+  const m = await send("coord", { to: "dev", body: "long one", priority: "high" });
+  let d = (await api("dev", "GET", "/hook/digest")).body;
+  assert.equal(d.unread.by_priority.high, 1);
+  const full = (await api("dev", "GET", `/msg/${m.body.id}?read=1`)).body;
+  assert.equal(full.status, "delivered");
+  d = (await api("dev", "GET", "/hook/digest")).body;
+  assert.equal(d.unread.total, 0);
+  // a third party cannot mark it, and the sender reading it does not affect the recipient
+  assert.equal((await api("other", "GET", `/msg/${m.body.id}?read=1`)).status, 403);
+});

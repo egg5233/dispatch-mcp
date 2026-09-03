@@ -123,15 +123,19 @@ function resolveRuntime() {
 const RUNTIME = resolveRuntime();
 const USE_GRACE = RUNTIME === "claude" && HOOK_GRACE_MS > 0;
 
-// Log `blocked:` at most once per reason per BLOCK_LOG_MS, so a pane that
-// sits in a blocked state for hours doesn't flood the pm2 log at 1.5s/tick.
+// Log `blocked:` (and post one `blocked` delivery record) at most once per
+// reason per BLOCK_LOG_MS, so a pane that sits in a blocked state for hours
+// doesn't flood the pm2 log and the deliveries table at 1.5s/tick. The dedupe
+// key strips numbers: "presence busy (busy 292s ago …)" changes every tick,
+// which defeated the check on 2026-09-03 (83 records in two minutes).
 const BLOCK_LOG_MS = parseInt(process.env.DISPATCH_BLOCK_LOG_MS || "30000", 10);
-let lastBlockReason = "";
+let lastBlockKey = "";
 let lastBlockLoggedAt = 0;
 function logBlocked(reason) {
   const now = Date.now();
-  if (reason === lastBlockReason && now - lastBlockLoggedAt < BLOCK_LOG_MS) return;
-  lastBlockReason = reason;
+  const key = String(reason).replace(/\d+/g, "#");
+  if (key === lastBlockKey && now - lastBlockLoggedAt < BLOCK_LOG_MS) return;
+  lastBlockKey = key;
   lastBlockLoggedAt = now;
   console.log(`[${ts()}] blocked: ${reason}`);
   postWake("blocked", reason);
@@ -156,7 +160,7 @@ function postWake(method, detail) {
   } catch { /* never let telemetry break the watcher */ }
 }
 function clearBlocked() {
-  lastBlockReason = "";
+  lastBlockKey = "";
 }
 
 // Strip box-drawing/decoration so we can tell an empty composer from a
@@ -447,7 +451,7 @@ setInterval(maybeWake, IDLE_POLL_MS);
 
 function handleEvent(event) {
   if (!event || !event.type) return;
-  const id = event.task?.id || event.message?.id || "?";
+  const id = event.task?.id || event.message?.id || (event.delivery ? `${event.delivery.handle}/${event.delivery.method}` : "?");
   if (!ACTIONABLE.has(event.type)) {
     console.log(`[${ts()}] fyi: ${event.type} #${id} from ${event.actor || "?"}`);
     return;

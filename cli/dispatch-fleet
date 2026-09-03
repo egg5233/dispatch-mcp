@@ -602,7 +602,11 @@ def cmd_add(args):
         touch(fleet)
         write_fleet(fleet)
     if not opts.get("no_watcher"):
-        cmd_watchers(restart=True, only=handle)
+        if cmd_watchers(restart=True, only=handle) == 0:
+            ent["watcher"] = "watch-" + handle
+            ent["watcher_pane"] = pane
+            touch(fleet)
+            write_fleet(fleet)
     else:
         print("no watcher (hooks-only handle)")
     print("done: %s in project %s. Test it: dispatch-send %s --type task --title \"hello\" \"[TASK] ack and report done\"" % (handle, project, handle))

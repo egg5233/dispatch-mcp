@@ -1355,7 +1355,10 @@ app.post("/wake", express.json(), (req, res) => {
   // HANDLING_S before any other path (watcher keystroke, Wait rewake) may act.
   let handling = 0;
   if ((method === "hook" || method === "wait-rewake") && ids.length) handling = markHandling(ids, HANDLING_S);
-  dispatchEvents.emit("task", { type: "delivery", delivery: { handle, method, message_ids: ids, detail: b.detail || null }, actor: "server", recipients: [], timestamp: new Date().toISOString() });
+  // Addressed to the handle it concerns: its own watcher may react, the
+  // dashboard stream sees everything anyway, and the other watchers no longer
+  // log an "fyi: delivery" line for every record on the host.
+  dispatchEvents.emit("task", { type: "delivery", delivery: { handle, method, message_ids: ids, detail: b.detail || null }, actor: "server", recipients: [handle], timestamp: new Date().toISOString() });
   res.json({ ok: true, recorded: n, handling });
 });
 const HANDLING_S = parseInt(process.env.DISPATCH_HANDLING_S || "60", 10);

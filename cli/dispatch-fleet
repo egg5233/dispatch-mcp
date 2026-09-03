@@ -322,8 +322,21 @@ def cmd_check(as_json=False):
             "oldest_unread_at": sv.get("oldest_unread_at"), "open_tasks": sv.get("open_tasks"),
             "unacked_tasks": sv.get("unacked_tasks"), "verdict": "; ".join(verdict) or "ok",
         })
+    # ~/.dispatch vs repo drift (T-20260903-10): the hook and CLI run from
+    # ~/.dispatch; a stale copy there was one root cause of the triple-wake
+    # incident. deploy/install-cli.sh --check reports each differing file.
+    repo = (fleet.get("repo") or os.environ.get("DISPATCH_REPO") or "/var/solana/data/dispatch-mcp")
+    drift = []
+    chk = os.path.join(repo, "deploy", "install-cli.sh")
+    if os.path.exists(chk):
+        rc, out = sh(["bash", chk, "--check"], timeout=10)
+        if rc != 0:
+            drift = [l for l in out.splitlines() if l.startswith("STALE")] or ["STALE: install-cli.sh --check failed"]
+    else:
+        drift = ["no %s (repo path: set fleet.json \"repo\" or $DISPATCH_REPO)" % chk]
+    problems += len(drift)
     if as_json:
-        print(json.dumps({"server_error": server_err, "rows": rows}, ensure_ascii=False, indent=2))
+        print(json.dumps({"server_error": server_err, "cli_drift": drift, "rows": rows}, ensure_ascii=False, indent=2))
         return 1 if problems else 0
     cols = [("handle", 13), ("pane", 5), ("runtime", 7), ("pane_cmd", 9), ("match", 5),
             ("watcher", 8), ("session", 30), ("session_status", 6), ("state", 8),
@@ -343,7 +356,13 @@ def cmd_check(as_json=False):
             cells.append(v if w == 0 else v.ljust(w)[:w])
         print("  ".join(cells).rstrip())
     print("")
-    print("%d handle(s), %d with problems.%s" % (len(rows), problems, "  server: %s" % server_err if server_err else ""))
+    if drift:
+        for d in drift:
+            print("cli drift: %s" % d)
+        print("           fix: %s" % chk)
+    else:
+        print("cli: ~/.dispatch matches %s/cli" % repo)
+    print("%d handle(s), %d problem(s).%s" % (len(rows), problems, "  server: %s" % server_err if server_err else ""))
     return 1 if problems else 0
 
 

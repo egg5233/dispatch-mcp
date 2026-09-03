@@ -1360,13 +1360,15 @@ app.get("/api/messages/:id/thread", requireJwt, (req, res) => {
 
 app.get("/api/inbox", requireJwt, (req, res) => {
   const presence = new Map(getPresence().map((p) => [p.user, p]));
-  const rows = listUsers().map((u) => {
+  const { kindOf } = classifyHandles();
+  const order = { local: 0, remote: 1 };
+  const rows = listUsers().filter((u) => kindOf(u.handle) !== "retired").map((u) => {
     const d = inboxDepth(u.handle);
     const p = presence.get(u.handle);
     const unacked = unackedRequiredFor(u.handle);
     const open = getOpenTasksFor(u.handle);
     return {
-      handle: u.handle, last_seen_at: toDisplayTz(u.last_seen_at),
+      handle: u.handle, kind: kindOf(u.handle), last_seen_at: toDisplayTz(u.last_seen_at), last_seen_ip: u.last_seen_ip || null,
       state: p?.state || null, state_at: toDisplayTz(p?.state_at || null), session: p?.session || null,
       unread: d.n || 0, unread_high_plus: d.high_plus || 0,
       oldest_unread_at: toDisplayTz(d.oldest), oldest_unread_age_s: d.oldest ? Math.round((Date.now() - new Date(d.oldest.replace(" ", "T") + "Z").getTime()) / 1000) : null,
@@ -1374,7 +1376,7 @@ app.get("/api/inbox", requireJwt, (req, res) => {
       open_tasks: open.map((t) => t.id),
       unacked_tasks: open.filter((t) => t.ack_required && !t.acked_at).map((t) => t.id),
     };
-  });
+  }).sort((a, b) => (order[a.kind] - order[b.kind]) || a.handle.localeCompare(b.handle));
   res.json({ server_time: toDisplayTz(utcNow()), handles: rows });
 });
 
@@ -1408,6 +1410,15 @@ function fleetCheck(cb) {
 function localFleetFile() {
   try { return JSON.parse(readFileSyncFs(`${homedir()}/.dispatch/fleet.json`, "utf8")); } catch { return {}; }
 }
+// One classification for every handle-listing surface (inbox strip, filter
+// menus, composer, Fleet tab): local = in this host's fleet.json, retired =
+// in its retired list (never shown), remote = everything else on the server.
+function classifyHandles() {
+  const fleet = localFleetFile();
+  const local = new Set(Object.keys(fleet.handles || {}));
+  const retired = new Set(fleet.retired || []);
+  return { fleet, kindOf: (h) => (retired.has(h) ? "retired" : local.has(h) ? "local" : "remote") };
+}
 app.get("/api/fleet", requireJwt, (req, res) => {
   fleetCheck((data) => {
     const presence = new Map(getPresence().map((p) => [p.user, p]));
@@ -1415,12 +1426,11 @@ app.get("/api/fleet", requireJwt, (req, res) => {
       const p = presence.get(r.handle);
       return { ...r, presence_state: p?.state || null, presence_at: toDisplayTz(p?.state_at || null), presence_session: p?.session || null };
     });
-    const fleet = localFleetFile();
-    const local = new Set([...Object.keys(fleet.handles || {}), ...rows.map((r) => r.handle)]);
+    const { fleet, kindOf } = classifyHandles();
     const retired = fleet.retired || [];
-    const retiredSet = new Set(retired);
+    const rowHandles = new Set(rows.map((r) => r.handle));
     const remote = listUsers()
-      .filter((u) => !local.has(u.handle) && !retiredSet.has(u.handle) && u.handle !== req.user.handle)
+      .filter((u) => kindOf(u.handle) === "remote" && !rowHandles.has(u.handle))
       .map((u) => {
         const p = presence.get(u.handle);
         const d = inboxDepth(u.handle);

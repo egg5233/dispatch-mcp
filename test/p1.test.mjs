@@ -423,3 +423,15 @@ test("/api/fleet: remote section lists server users absent from fleet.json; reti
   assert.ok(o, "test user 'other' should be listed as remote");
   assert.ok("unread" in o && "last_seen_at" in o);
 });
+
+test("/api/inbox: every non-retired handle carries kind local|remote, remote sorted after local", async () => {
+  const r = await dash("coord", "GET", "/api/inbox");
+  assert.equal(r.status, 200);
+  const kinds = r.body.handles.map((h) => h.kind);
+  assert.ok(kinds.every((k) => k === "local" || k === "remote"));
+  const firstRemote = kinds.indexOf("remote"), lastLocal = kinds.lastIndexOf("local");
+  assert.ok(firstRemote === -1 || lastLocal === -1 || lastLocal < firstRemote, "local rows must precede remote rows");
+  const o = r.body.handles.find((h) => h.handle === "other");
+  assert.equal(o.kind, "remote");
+  assert.ok("last_seen_at" in o && "last_seen_ip" in o);
+});

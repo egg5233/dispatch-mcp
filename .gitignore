@@ -4,3 +4,7 @@ logs
 *.log
 __pycache__/
 .pm2/
+
+# the coordination template ships a data/ and logs/ skeleton; the rules above must not swallow them
+!templates/coordination/data/
+!templates/coordination/logs/

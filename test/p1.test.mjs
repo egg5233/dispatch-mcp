@@ -412,3 +412,14 @@ test("presence/me: busy is fresh; unknown handle has no state", async () => {
   assert.equal(p.state, null);
   assert.equal(p.fresh, false);
 });
+
+test("/api/fleet: remote section lists server users absent from fleet.json; retired list present", async () => {
+  const r = await dash("coord", "GET", "/api/fleet");
+  assert.equal(r.status, 200);
+  assert.ok(Array.isArray(r.body.remote));
+  assert.ok(Array.isArray(r.body.retired));
+  // 'other' exists on this test server but is not a local tmux pane on this host
+  const o = r.body.remote.find((x) => x.handle === "other");
+  assert.ok(o, "test user 'other' should be listed as remote");
+  assert.ok("unread" in o && "last_seen_at" in o);
+});

@@ -202,6 +202,9 @@
   <div class="panel" id="panel-fleet">
     <div class="section-title">Fleet 健康（伺服器端執行 dispatch-fleet check，每 5 秒快取）<span id="fleet-when" class="dim" style="font-family:var(--mono);font-size:11px;letter-spacing:0"></span></div>
     <div class="card" style="overflow:auto"><table id="fleet-table"></table></div>
+    <div class="section-title">Remote（伺服器有帳號、但不在本機 fleet.json 的 handle，例如 i5 上的 agent）</div>
+    <div class="card" style="overflow:auto"><table id="remote-table"></table></div>
+    <details class="card" style="margin-top:12px"><summary style="cursor:pointer;font-family:var(--mono);font-size:12px;color:var(--text-dim)">已退役 handle（<span id="retired-count">0</span>）— 不再列於 fleet，名字相近時請對照這裡</summary><div id="retired-list" style="font-family:var(--mono);font-size:12px;margin-top:8px;color:var(--text-dim)"></div></details>
   </div>
 
   <div class="session-bar"><span id="session-handle">—</span> · <a id="change-pw">變更密碼</a> · <a id="logout">登出</a></div>
@@ -303,6 +306,9 @@ function renderFleet(){
   $('b-fleet').textContent=problems?problems+'!':rows.length;$('b-fleet').className='badge'+(problems?' hot':'');
   $('fleet-when').textContent=(f.checked_at||'')+(f.server_error?' · '+f.server_error:'');
   const inbox=new Map((state.inbox?.handles||[]).map(h=>[h.handle,h]));
+  const rem=f.remote||[];
+  $('remote-table').innerHTML=rem.length?`<tr><th>handle</th><th>last seen</th><th>from IP</th><th>hook state</th><th>unread</th><th>最舊未讀</th><th>open tasks</th></tr>`+rem.map(r=>`<tr><td><b>${esc(r.handle)}</b></td><td>${esc(r.last_seen_at||'never')}</td><td class="dim">${esc(r.last_seen_ip||'')}</td><td class="${r.presence_state==='busy'?'warn':r.presence_state==='idle'?'ok':'dim'}">${esc(r.presence_state||'—')}<div class="dim" style="font-size:10px">${esc(r.presence_at||'')}</div></td><td class="${r.unread_high_plus?'bad':r.unread?'warn':'ok'}">${r.unread}${r.unread_high_plus?' ('+r.unread_high_plus+'!)':''}</td><td>${r.oldest_unread_at?agoFromUtc(r.oldest_unread_at.slice(0,19)):''}</td><td>${r.open_tasks}</td></tr>`).join(''):`<tr><td class="dim">沒有遠端 handle</td></tr>`;
+  const ret=f.retired||[];$('retired-count').textContent=ret.length;$('retired-list').textContent=ret.length?ret.join('  ·  '):'（無）';
   $('fleet-table').innerHTML=`<tr><th>handle</th><th>pane</th><th>runtime</th><th>前景</th><th>watcher</th><th>Claude session</th><th>hook state</th><th>unread</th><th>最舊未讀</th><th>open / 未ack</th><th>verdict</th></tr>`+rows.map(r=>{const ib=inbox.get(r.handle)||{};return `<tr class="${r.verdict==='ok'?'':'problem'}"><td><b>${esc(r.handle)}</b></td><td>${esc(r.pane)}</td><td>${esc(r.runtime)}</td><td class="${r.match?'ok':'bad'}">${esc(r.pane_cmd)}</td><td class="${r.watcher==='online'?'ok':r.watcher==='none'?'dim':'bad'}">${esc(r.watcher)}${r.watcher_pane&&r.watcher_pane!==r.pane?' <span class="bad">('+esc(r.watcher_pane)+')</span>':''}</td><td>${esc(r.session||'')} <span class="${r.session_status==='busy'?'warn':r.session_status==='idle'?'ok':'dim'}">${esc(r.session_status||'')}</span></td><td class="${r.presence_state==='busy'?'warn':r.presence_state==='idle'?'ok':'dim'}">${esc(r.presence_state||'—')}<div class="dim" style="font-size:10px">${esc(r.presence_at||'')}</div></td><td class="${(ib.unread_high_plus)?'bad':ib.unread?'warn':'ok'}">${ib.unread??r.unread??0}${ib.unread_high_plus?' ('+ib.unread_high_plus+'!)':''}</td><td>${ib.oldest_unread_age_s!=null?ago(ib.oldest_unread_age_s):''}</td><td>${(ib.open_tasks||[]).length} / <span class="${(ib.unacked_tasks||[]).length?'warn':''}">${(ib.unacked_tasks||[]).length}</span></td><td class="${r.verdict==='ok'?'ok':'bad'}">${esc(r.verdict)}</td></tr>`;}).join('');
 }
 async function loadFleet(){state.fleet=await j(`${API}/fleet`);renderFleet();}

@@ -1400,6 +1400,14 @@ function fleetCheck(cb) {
   });
 }
 
+// Local rows come from dispatch-fleet check (this host's tmux panes).
+// `remote` = server users that are neither in fleet.json nor retired — agents
+// on other hosts (i5 …) reached over the tunnel. `retired` is fleet.json's
+// list, shown collapsed so look-alike names (codex vs kernel-codex) don't
+// confuse anyone.
+function localFleetFile() {
+  try { return JSON.parse(readFileSyncFs(`${homedir()}/.dispatch/fleet.json`, "utf8")); } catch { return {}; }
+}
 app.get("/api/fleet", requireJwt, (req, res) => {
   fleetCheck((data) => {
     const presence = new Map(getPresence().map((p) => [p.user, p]));
@@ -1407,7 +1415,23 @@ app.get("/api/fleet", requireJwt, (req, res) => {
       const p = presence.get(r.handle);
       return { ...r, presence_state: p?.state || null, presence_at: toDisplayTz(p?.state_at || null), presence_session: p?.session || null };
     });
-    res.json({ ...data, rows });
+    const fleet = localFleetFile();
+    const local = new Set([...Object.keys(fleet.handles || {}), ...rows.map((r) => r.handle)]);
+    const retired = fleet.retired || [];
+    const retiredSet = new Set(retired);
+    const remote = listUsers()
+      .filter((u) => !local.has(u.handle) && !retiredSet.has(u.handle) && u.handle !== req.user.handle)
+      .map((u) => {
+        const p = presence.get(u.handle);
+        const d = inboxDepth(u.handle);
+        return {
+          handle: u.handle, last_seen_at: toDisplayTz(u.last_seen_at), last_seen_ip: u.last_seen_ip || null,
+          presence_state: p?.state || null, presence_at: toDisplayTz(p?.state_at || null), presence_session: p?.session || null,
+          unread: d.n || 0, unread_high_plus: d.high_plus || 0, oldest_unread_at: toDisplayTz(d.oldest),
+          open_tasks: getOpenTasksFor(u.handle).length,
+        };
+      });
+    res.json({ ...data, rows, remote, retired });
   });
 });
 

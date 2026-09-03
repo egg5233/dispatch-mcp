@@ -208,6 +208,10 @@ Watcher (`skills/dispatch-worktree/scripts/dispatch-watch.js`, one pm2 `watch-<h
 
 Codex CLI 0.148.0 ships lifecycle hooks (`codex features list` → `hooks stable true`; config file `hooks.json`, hooks must be trusted once in the TUI or run with `--dangerously-bypass-hook-trust`). The binary carries Claude-compatible wire types for `SessionStart`, `UserPromptSubmit`, `PreToolUse` (`permissionDecision` allow/deny + `additionalContext`), `PostToolUse`, `PermissionRequest`, `PreCompact`/`PostCompact`, `SubagentStart`/`SubagentStop`, `SessionEnd` — but **no `Stop` event and no async rewake**. So `hook.sh` could give a Codex handle the same digest-at-prompt and immediate-at-tool-boundary behaviour (same JSON in and out), but not the "block the stop until you read medium+" rule nor the idle wake. Codex idle wake therefore stays on the guarded keystroke watcher (P0). Wiring `hook.sh` into a Codex `hooks.json` has **not** been tested on a live Codex session yet; the exact `hooks.json` shape is not documented in `docs/config.md` (which only covers `allow_managed_hooks_only`).
 
+## Installing the CLI to `~/.dispatch`
+
+`deploy/install-cli.sh` copies `cli/*` into `~/.dispatch` (idempotent; `--check` only reports drift). Run it after every pull that touches `cli/` — the hook and CLI run from `~/.dispatch`, not from the checkout, and a forgotten copy once left the hook without its delivery-record code for hours.
+
 ## Tests
 
 ```bash

@@ -1,0 +1,9 @@
+# bulk experiment output and archived material stay out of git (README.md inside each is kept)
+data/**
+!data/README.md
+archive/**
+!archive/README.md
+# tooling noise
+__pycache__/
+*.tmp
+*.lock

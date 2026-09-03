@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# dispatch-init-project — create a project's coordination/ from the template and register it with dispatch.
+#
+#   dispatch-init-project <name> --workspace <dir> [--coordinator <handle>] [--dry-run] [--no-launch]
+#
+# Steps (each skipped when already done, so re-running is safe):
+#   1 validate name ([a-z0-9-]) and workspace dir
+#   2 copy templates/coordination -> <dir>/coordination, substitute {{PROJECT}} {{WORKSPACE}} {{COORDINATOR}} {{DATE}};
+#     never overwrite an existing file
+#   3 git init + first commit in <dir>/coordination
+#   4 dispatch-fleet project add <name> --dir <dir>/coordination --session <name> --coordinator <handle>
+#   5 tmux session <name> (create if missing, -c <dir>)
+#   6 dispatch-fleet add <handle> --project <name> --cwd <dir>/coordination --runtime claude --session <name> --window coord
+# Template location: $DISPATCH_REPO/templates/coordination, else the checkout this script lives in,
+# else fleet.json "repo", else /var/solana/data/dispatch-mcp.
+set -euo pipefail
+
+usage() { sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-1}"; }
+die() { echo "dispatch-init-project: $*" >&2; exit 1; }
+say() { echo "[$1]$([ "$DRY" = 1 ] && echo " (dry-run)") $2"; }
+
+NAME=""; WS=""; COORD=""; DRY=0; LAUNCH=1
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --workspace|-w) WS="${2:-}"; shift 2 ;;
+    --workspace=*) WS="${1#*=}"; shift ;;
+    --coordinator|-c) COORD="${2:-}"; shift 2 ;;
+    --coordinator=*) COORD="${1#*=}"; shift ;;
+    --dry-run) DRY=1; shift ;;
+    --no-launch) LAUNCH=0; shift ;;
+    -h|--help) usage 0 ;;
+    -*) die "unknown flag $1" ;;
+    *) [ -z "$NAME" ] && NAME="$1" || die "unexpected argument $1"; shift ;;
+  esac
+done
+[ -n "$NAME" ] || usage
+[[ "$NAME" =~ ^[a-z0-9][a-z0-9-]*$ ]] || die "name must match [a-z0-9-] and start alphanumeric: $NAME"
+[ -n "$WS" ] || die "--workspace <dir> is required"
+[ -d "$WS" ] || die "workspace dir does not exist: $WS"
+WS="$(cd "$WS" && pwd)"
+COORD="${COORD:-coord-$NAME}"
+[[ "$COORD" =~ ^[a-z0-9][a-z0-9-]*$ ]] || die "coordinator handle must match [a-z0-9-]: $COORD"
+CDIR="$WS/coordination"
+DISPATCH_HOME="${DISPATCH_HOME:-$HOME/.dispatch}"
+FLEET="$DISPATCH_HOME/dispatch-fleet"; [ -x "$FLEET" ] || FLEET="$(dirname "$(realpath "$0")")/dispatch-fleet"
+
+# --- template dir -----------------------------------------------------------------------------
+HERE="$(cd "$(dirname "$(realpath "$0")")" && pwd)"
+REPO="${DISPATCH_REPO:-}"
+[ -z "$REPO" ] && [ -d "$HERE/../templates/coordination" ] && REPO="$(cd "$HERE/.." && pwd)"
+[ -z "$REPO" ] && [ -f "$DISPATCH_HOME/fleet.json" ] && REPO="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("repo",""))' "$DISPATCH_HOME/fleet.json" 2>/dev/null || true)"
+[ -z "$REPO" ] && REPO=/var/solana/data/dispatch-mcp
+TPL="$REPO/templates/coordination"
+[ -d "$TPL" ] || die "template dir not found: $TPL (set DISPATCH_REPO)"
+DATE="$(date +%F)"
+
+run() { if [ "$DRY" = 1 ]; then echo "  would: $*"; else "$@"; fi; }
+subst() { sed -e "s|{{PROJECT}}|$NAME|g" -e "s|{{WORKSPACE}}|$WS|g" -e "s|{{COORDINATOR}}|$COORD|g" -e "s|{{DATE}}|$DATE|g"; }
+
+echo "project=$NAME workspace=$WS coordination=$CDIR coordinator=$COORD template=$TPL$([ "$DRY" = 1 ] && echo ' (dry-run)')"
+
+# --- 2 copy template --------------------------------------------------------------------------
+copied=0; kept=0
+while IFS= read -r -d '' src; do
+  rel="${src#$TPL/}"; dst="$CDIR/$rel"
+  if [ -e "$dst" ]; then kept=$((kept+1)); continue; fi
+  if [ "$DRY" = 1 ]; then copied=$((copied+1)); continue; fi
+  mkdir -p "$(dirname "$dst")"
+  case "$rel" in
+    *.md|CLAUDE.md|.gitignore) subst < "$src" > "$dst" ;;
+    *) cp -p "$src" "$dst" ;;
+  esac
+  copied=$((copied+1))
+done < <(find "$TPL" -type f -print0 | sort -z)
+say template "$([ "$DRY" = 1 ] && echo would copy || echo copied) $copied file(s), kept $kept existing"
+
+# --- 3 git -------------------------------------------------------------------------------------
+if [ -d "$CDIR/.git" ]; then say git "already a repo: $CDIR"
+else
+  run git -C "$CDIR" init -q -b main 2>/dev/null || run git -C "$CDIR" init -q
+  say git "initialized $CDIR"
+fi
+if [ "$DRY" = 0 ]; then
+  git -C "$CDIR" add -A
+  if ! git -C "$CDIR" diff --cached --quiet; then
+    git -C "$CDIR" commit -q -m "init coordination/ for $NAME from dispatch-mcp templates/coordination" && say git "first commit $(git -C "$CDIR" rev-parse --short HEAD)"
+  else say git "nothing to commit"; fi
+else say git "would add + commit"; fi
+
+# --- 4 register project ------------------------------------------------------------------------
+if "$FLEET" project list 2>/dev/null | grep -qE "^\s*$NAME\b"; then say project "already registered: $NAME"
+else run "$FLEET" project add "$NAME" --dir "$CDIR" --session "$NAME" --coordinator "$COORD" && say project "registered $NAME -> $CDIR (session $NAME, coordinator $COORD)"; fi
+
+# --- 5 tmux session ----------------------------------------------------------------------------
+if tmux has-session -t "=$NAME" 2>/dev/null; then say tmux "session exists: $NAME"
+else run tmux new-session -d -s "$NAME" -c "$WS" && say tmux "created session $NAME (cwd $WS)"; fi
+
+# --- 6 coordinator -----------------------------------------------------------------------------
+if [ "$LAUNCH" = 0 ]; then say coordinator "skipped (--no-launch); run: $FLEET add $COORD --project $NAME --cwd $CDIR --runtime claude --session $NAME --window coord"
+elif python3 -c 'import json,sys;sys.exit(0 if sys.argv[2] in json.load(open(sys.argv[1]))["handles"] else 1)' "$DISPATCH_HOME/fleet.json" "$COORD" 2>/dev/null; then say coordinator "already in fleet.json: $COORD"
+else run "$FLEET" add "$COORD" --project "$NAME" --cwd "$CDIR" --runtime claude --session "$NAME" --window coord && say coordinator "launched + registered $COORD"; fi
+
+echo
+echo "next: $FLEET check   |   add agents: $FLEET add $NAME-<role> --project $NAME --cwd <dir> --runtime claude|codex"
+echo "      runbook: $REPO/docs/runbooks/onboard-new-project.md"

@@ -260,6 +260,10 @@ Codex CLI 0.148.0 ships lifecycle hooks (`codex features list` → `hooks stable
 
 `deploy/install-cli.sh` copies `cli/*` into `~/.dispatch` (idempotent; `--check` only reports drift). Run it after every pull that touches `cli/` — the hook and CLI run from `~/.dispatch`, not from the checkout, and a forgotten copy once left the hook without its delivery-record code for hours.
 
+## Projects (several projects on one server)
+
+Each project has its own coordinator, agents, tmux session and `coordination/` directory; server, CLI, hooks and dashboard are shared. `templates/coordination/` is the directory template (taxonomy, generic README, STATUS board, coordinator `CLAUDE.md`, `.gitignore`); `cli/dispatch-init-project <name> --workspace <dir>` copies it, `git init`s it, registers the project and launches the coordinator; `docs/runbooks/onboard-new-project.md` is the runbook (prerequisites, init, adding agents, verification, remote hosts, offboarding, troubleshooting). Naming: tmux session = project name, coordinator `coord-<project>`, agents `<project>-<role>`; every agent addresses its own coordinator as `coord`.
+
 ## Tests
 
 ```bash

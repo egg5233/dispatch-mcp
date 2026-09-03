@@ -77,6 +77,13 @@ const PRIORITY_RANK = { low: 0, medium: 1, high: 2, immediate: 3, normal: 1, urg
 const MIN_WAKE_PRIORITY = process.env.DISPATCH_MIN_WAKE_PRIORITY || "medium";
 const MIN_WAKE_RANK = PRIORITY_RANK[MIN_WAKE_PRIORITY] ?? 1;
 const FLEET_PATH = process.env.DISPATCH_FLEET || `${os.homedir()}/.dispatch/fleet.json`;
+// dispatch v2 T-20260903-08: with hooks rolled out fleet-wide, the keystroke
+// is the LAST resort for Claude panes. After a wake becomes pending we give
+// the hook paths (asyncRewake waiter / Stop block / next-turn digest) this
+// long to drain the message before we consider typing. If the agent read it
+// in the meantime (server says nothing unread at medium+), no keystroke.
+// Codex panes have no hooks and keep the immediate behaviour.
+const HOOK_GRACE_MS = parseInt(process.env.DISPATCH_HOOK_GRACE_MS || "20000", 10);
 
 // Expected foreground command for THIS watcher's pane. Explicit env wins;
 // otherwise derive it from registry.json (pane id -> runtime -> command).
@@ -102,6 +109,19 @@ function resolveExpectCmd() {
   return "";
 }
 const EXPECT_CMD = resolveExpectCmd();
+// Runtime of this pane (claude | codex | ""), for the hook grace decision.
+function resolveRuntime() {
+  try {
+    const fleet = JSON.parse(fs.readFileSync(FLEET_PATH, "utf8"));
+    for (const ent of Object.values(fleet.handles || {})) if (ent.pane === TMUX_TARGET) return ent.runtime || "";
+  } catch { /* fall through */ }
+  try {
+    const reg = JSON.parse(fs.readFileSync(REGISTRY_PATH, "utf8"));
+    return (reg[TMUX_TARGET] || {}).runtime || "";
+  } catch { return ""; }
+}
+const RUNTIME = resolveRuntime();
+const USE_GRACE = RUNTIME === "claude" && HOOK_GRACE_MS > 0;
 
 // Log `blocked:` at most once per reason per BLOCK_LOG_MS, so a pane that
 // sits in a blocked state for hours doesn't flood the pm2 log at 1.5s/tick.
@@ -224,6 +244,7 @@ function ts() {
 let lastFiredAt = 0;
 let wakePending = false;
 let lastLabel = "";
+let pendingSince = 0;
 
 // Decide whether it is safe to type into the target pane. Runs three
 // guards plus the original busy-marker check; `cb(ok, reason)`.
@@ -328,15 +349,57 @@ function pokeTmux() {
   });
 }
 
+// Ask the server whether anything at medium+ is still unread for this
+// handle. Used after the hook grace period: if the hooks already got the
+// message to the agent, the keystroke is unnecessary.
+function stillUnread(cb) {
+  if (!BASE_URL || !TOKEN) return cb(true);
+  try {
+    const u = new URL(BASE_URL + "/msg/recv?peek=1&priority=medium&limit=1");
+    const mod = u.protocol === "https:" ? https : http;
+    const req = mod.request({ host: u.hostname, port: u.port || (u.protocol === "https:" ? 443 : 80), path: u.pathname + u.search, method: "GET",
+      headers: { Authorization: `Bearer ${TOKEN}` }, timeout: 3000 }, (res) => {
+      let body = "";
+      res.on("data", (c) => (body += c));
+      res.on("end", () => { try { cb((JSON.parse(body).count || 0) > 0); } catch { cb(true); } });
+    });
+    req.on("error", () => cb(true));
+    req.on("timeout", () => { req.destroy(); cb(true); });
+    req.end();
+  } catch { cb(true); }
+}
+
+let graceChecking = false;
 function maybeWake() {
   if (!wakePending) return;
   if (Date.now() - lastFiredAt < MIN_INTERVAL) return;
+  if (USE_GRACE) {
+    const waited = Date.now() - pendingSince;
+    if (waited < HOOK_GRACE_MS) return; // hooks get the first HOOK_GRACE_MS
+    if (graceChecking) return;
+    graceChecking = true;
+    return stillUnread((unread) => {
+      graceChecking = false;
+      if (!unread) {
+        console.log(`[${ts()}] no keystroke: hooks delivered within ${Math.round(waited / 1000)}s (${lastLabel})`);
+        postWake("hook", `delivered by hooks within grace (${Math.round(waited / 1000)}s), watcher stood down`);
+        wakePending = false; pendingIds = []; clearBlocked();
+        return;
+      }
+      fireIfIdle(waited);
+    });
+  }
+  fireIfIdle(0);
+}
+
+function fireIfIdle(waitedMs) {
   checkGuards((ok, reason) => {
     if (!wakePending) return;      // drained while checking
     if (!ok) { logBlocked(reason); return; }  // retry next tick; payload safe on server
     clearBlocked();
     wakePending = false;
     lastFiredAt = Date.now();
+    if (waitedMs) console.log(`[${ts()}] hooks did not deliver in ${Math.round(waitedMs / 1000)}s — falling back to keystroke`);
     pokeTmux();
   });
 }
@@ -358,6 +421,7 @@ function handleEvent(event) {
   }
   lastLabel = `${event.type} #${id} from ${event.actor || "?"}`;
   if (event.message?.id && !pendingIds.includes(event.message.id)) pendingIds.push(event.message.id);
+  if (!wakePending) pendingSince = Date.now();
   wakePending = true;
   console.log(`[${ts()}] wake pending (idle-gated): ${lastLabel}`);
 }
@@ -486,6 +550,7 @@ console.log(`  prompt:       ${PROMPT}`);
 console.log(`  min interval: ${MIN_INTERVAL}ms`);
 console.log(`  idle gate:    poll ${IDLE_POLL_MS}ms, busy marker "${BUSY_MARKER}"`);
 console.log(`  min wake:     priority ${MIN_WAKE_PRIORITY}+ (lower waits for the agent's next turn)`);
+console.log(`  hook grace:   ${USE_GRACE ? `${HOOK_GRACE_MS}ms for runtime=${RUNTIME} (keystroke is last resort)` : `off (runtime=${RUNTIME || "?"})`}`);
 console.log(`  guards:       ${GUARDS_OFF ? "DISABLED (DISPATCH_GUARDS_OFF=1)" : `expect cmd "${EXPECT_CMD || "<unknown — will fail closed>"}", human-idle ${HUMAN_IDLE_MS}ms`}`);
 console.log(`  reconnect:    ${RECONNECT_MS}ms`);
 console.log(`  dry run:      ${DRY_RUN}`);

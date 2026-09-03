@@ -30,6 +30,8 @@ import http from "http";
 import https from "https";
 import { URL } from "url";
 import { execFile } from "child_process";
+import fs from "fs";
+import os from "os";
 
 const URL_STR = process.env.DISPATCH_URL;
 const TOKEN = process.env.DISPATCH_TOKEN;
@@ -45,6 +47,80 @@ const DRY_RUN = process.env.DISPATCH_DRY_RUN === "1";
 const BUSY_MARKER = process.env.DISPATCH_BUSY_MARKER || "esc to interrupt";
 const IDLE_POLL_MS = parseInt(process.env.DISPATCH_IDLE_POLL_MS || "1500", 10);
 const TMUX_BIN = process.env.DISPATCH_TMUX || "tmux";
+
+// ── Send-keys guards (added 2026-09-03, dispatch v2 P0) ────────────
+//
+// WHY: the idle gate above only looked for BUSY_MARKER. A pane whose agent
+// has EXITED (back to a bash prompt) shows no marker at all, so it read as
+// "idle" and we typed the prompt straight into the shell. That really
+// happened on %7/%10 (`bash: syntax error near unexpected token '('`) and
+// %6 (codex had crashed out to bash). Three guards now gate every poke;
+// if any fails we log one `blocked:` line and retry on the next tick —
+// the payload stays safe on the server, so deferring costs nothing.
+const EXPECT_CMD_ENV = process.env.DISPATCH_EXPECT_CMD || "";
+const REGISTRY_PATH =
+  process.env.DISPATCH_REGISTRY || `${os.homedir()}/.dispatch/registry.json`;
+// runtime -> expected #{pane_current_command}. codex runs as a node process
+// (measured 2026-09-03 on %5: `node .../bin/codex --dangerously-bypass...`).
+const RUNTIME_CMD = { claude: "claude", codex: "node" };
+const HUMAN_IDLE_MS = parseInt(process.env.DISPATCH_HUMAN_IDLE_MS || "8000", 10);
+// Composer placeholders that LOOK like residual text but are not. codex
+// renders a grey hint after its `\u203a` prompt; treat those as empty.
+const PLACEHOLDERS = (process.env.DISPATCH_PLACEHOLDERS ||
+  "Write tests for @filename").split("|").map((x) => x.trim()).filter(Boolean);
+// Escape hatch: DISPATCH_GUARDS_OFF=1 restores pre-v2 behaviour.
+const GUARDS_OFF = process.env.DISPATCH_GUARDS_OFF === "1";
+
+// Expected foreground command for THIS watcher's pane. Explicit env wins;
+// otherwise derive it from registry.json (pane id -> runtime -> command).
+// Empty string = unknown -> guard A cannot run, and we FAIL CLOSED.
+function resolveExpectCmd() {
+  if (EXPECT_CMD_ENV) return EXPECT_CMD_ENV;
+  try {
+    const reg = JSON.parse(fs.readFileSync(REGISTRY_PATH, "utf8"));
+    const ent = reg[TMUX_TARGET];
+    if (ent && ent.runtime) return RUNTIME_CMD[ent.runtime] || ent.runtime;
+  } catch (e) {
+    console.error(`[${ts()}] registry read failed (${REGISTRY_PATH}): ${e.message}`);
+  }
+  return "";
+}
+const EXPECT_CMD = resolveExpectCmd();
+
+// Log `blocked:` at most once per reason per BLOCK_LOG_MS, so a pane that
+// sits in a blocked state for hours doesn't flood the pm2 log at 1.5s/tick.
+const BLOCK_LOG_MS = parseInt(process.env.DISPATCH_BLOCK_LOG_MS || "30000", 10);
+let lastBlockReason = "";
+let lastBlockLoggedAt = 0;
+function logBlocked(reason) {
+  const now = Date.now();
+  if (reason === lastBlockReason && now - lastBlockLoggedAt < BLOCK_LOG_MS) return;
+  lastBlockReason = reason;
+  lastBlockLoggedAt = now;
+  console.log(`[${ts()}] blocked: ${reason}`);
+}
+function clearBlocked() {
+  lastBlockReason = "";
+}
+
+// Strip box-drawing/decoration so we can tell an empty composer from a
+// half-typed one. Keeps it deliberately crude — this guard is best-effort.
+function composerResidue(capture) {
+  const lines = capture.split("\n");
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i];
+    const m = /[\u276f\u203a>][ \u00a0]?(.*)$/.exec(line);
+    if (!m) continue;
+    let rest = m[1]
+      .replace(/[\u2500-\u257f]/g, "")   // box drawing
+      .replace(/[\u00a0\s]/g, " ")
+      .trim();
+    if (!rest) return "";
+    if (PLACEHOLDERS.some((ph) => rest === ph || rest.startsWith(ph))) return "";
+    return rest;
+  }
+  return ""; // no prompt marker found -> cannot tell -> treat as empty
+}
 
 function die(msg) {
   console.error(msg);
@@ -103,21 +179,79 @@ let lastFiredAt = 0;
 let wakePending = false;
 let lastLabel = "";
 
-// Capture the target pane and decide if the agent is idle (safe to poke).
-// Busy = the TUI is showing its interrupt hint (BUSY_MARKER). On any
-// capture error we report "not idle" so we never fire blind.
-function checkIdle(cb) {
-  // capture-pane is read-only, so we run it even in DRY_RUN (only the
-  // send-keys poke is suppressed). With no target at all there's nothing
-  // to inspect, so treat as idle.
-  if (!TMUX_TARGET) return cb(true);
-  execFile(TMUX_BIN, ["capture-pane", "-p", "-t", TMUX_TARGET], (err, stdout) => {
-    if (err) {
-      console.error(`[${ts()}] capture-pane failed: ${err.message}`);
-      return cb(false);
+// Decide whether it is safe to type into the target pane. Runs three
+// guards plus the original busy-marker check; `cb(ok, reason)`.
+//
+//   A. foreground command  — #{pane_current_command} must equal the runtime
+//      this handle is registered as. This is the one that stops us typing
+//      into a bash prompt after an agent has exited. FAILS CLOSED: if we
+//      cannot determine the expected command we refuse to send.
+//   B. human activity      — a human touching the session in the last
+//      HUMAN_IDLE_MS means hands are on the keyboard; defer.
+//   C. composer empty      — best-effort: don't append to half-typed input.
+//
+// Any tmux error also blocks: we never fire blind.
+function checkGuards(cb) {
+  if (!TMUX_TARGET) return cb(true, "");
+  execFile(
+    TMUX_BIN,
+    ["display", "-p", "-t", TMUX_TARGET,
+     "#{pane_current_command}\n#{session_activity}\n#{session_name}"],
+    (err, out) => {
+      if (err) return cb(false, `tmux display failed: ${err.message}`);
+      const parts = String(out).split("\n").map((x) => x.trim());
+      const cmd = parts[0] || "";
+      const sessAct = parseInt(parts[1] || "0", 10) || 0;
+      const sessName = parts[2] || "";
+
+      // ── Guard A: foreground command ──
+      if (!GUARDS_OFF) {
+        if (!EXPECT_CMD) {
+          return cb(false,
+            `no expected runtime for ${TMUX_TARGET} (registry miss) — failing closed`);
+        }
+        if (cmd !== EXPECT_CMD) {
+          return cb(false,
+            `foreground is "${cmd}", expected "${EXPECT_CMD}" — agent not running in ${TMUX_TARGET}`);
+        }
+      }
+
+      // ── Guard B: human activity ──
+      execFile(TMUX_BIN, ["list-clients", "-F", "#{client_session} #{client_activity}"],
+        (e2, cout) => {
+          let newest = sessAct;
+          if (!e2 && cout) {
+            for (const line of String(cout).split("\n")) {
+              const bits = line.trim().split(/\s+/);
+              if (bits.length === 2 && bits[0] === sessName) {
+                const a = parseInt(bits[1], 10) || 0;
+                if (a > newest) newest = a;
+              }
+            }
+          }
+          const ageMs = (Math.floor(Date.now() / 1000) - newest) * 1000;
+          if (!GUARDS_OFF && newest > 0 && ageMs >= 0 && ageMs < HUMAN_IDLE_MS) {
+            return cb(false,
+              `human activity ${Math.round(ageMs / 1000)}s ago in session "${sessName}" (< ${HUMAN_IDLE_MS / 1000}s)`);
+          }
+
+          // ── busy marker + Guard C: composer empty ──
+          execFile(TMUX_BIN, ["capture-pane", "-p", "-t", TMUX_TARGET], (e3, cap) => {
+            if (e3) return cb(false, `capture-pane failed: ${e3.message}`);
+            if (String(cap).includes(BUSY_MARKER)) {
+              return cb(false, "agent busy (interrupt hint visible)");
+            }
+            if (!GUARDS_OFF) {
+              const residue = composerResidue(String(cap));
+              if (residue) {
+                return cb(false, `composer not empty: ${JSON.stringify(residue.slice(0, 40))}`);
+              }
+            }
+            cb(true, "");
+          });
+        });
     }
-    cb(!stdout.includes(BUSY_MARKER));
-  });
+  );
 }
 
 function pokeTmux() {
@@ -147,9 +281,10 @@ function pokeTmux() {
 function maybeWake() {
   if (!wakePending) return;
   if (Date.now() - lastFiredAt < MIN_INTERVAL) return;
-  checkIdle((idle) => {
-    if (!wakePending) return; // drained while checking
-    if (!idle) return;        // busy — retry next tick; payload is safe in the server
+  checkGuards((ok, reason) => {
+    if (!wakePending) return;      // drained while checking
+    if (!ok) { logBlocked(reason); return; }  // retry next tick; payload safe on server
+    clearBlocked();
     wakePending = false;
     lastFiredAt = Date.now();
     pokeTmux();
@@ -272,13 +407,29 @@ function shutdown(sig) {
 process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 
+// --selftest: run the guards once against TMUX_TARGET, print the verdict,
+// exit 0 if we WOULD fire and 1 if blocked. Handy for auditing a pane
+// without waiting for a real event, and for the deploy DoD check.
+if (process.argv.includes("--selftest")) {
+  checkGuards((ok, reason) => {
+    console.log(
+      `selftest ${TMUX_TARGET}: ${ok ? "WOULD FIRE" : "BLOCKED"}` +
+      (reason ? ` — ${reason}` : "") +
+      `  (expect cmd "${EXPECT_CMD || "<unknown>"}")`
+    );
+    process.exit(ok ? 0 : 1);
+  });
+} else {
+
 console.log(`dispatch-watch`);
 console.log(`  events URL:   ${URL_STR}`);
 console.log(`  tmux target:  ${TMUX_TARGET || "(dry-run)"}`);
 console.log(`  prompt:       ${PROMPT}`);
 console.log(`  min interval: ${MIN_INTERVAL}ms`);
 console.log(`  idle gate:    poll ${IDLE_POLL_MS}ms, busy marker "${BUSY_MARKER}"`);
+console.log(`  guards:       ${GUARDS_OFF ? "DISABLED (DISPATCH_GUARDS_OFF=1)" : `expect cmd "${EXPECT_CMD || "<unknown — will fail closed>"}", human-idle ${HUMAN_IDLE_MS}ms`}`);
 console.log(`  reconnect:    ${RECONNECT_MS}ms`);
 console.log(`  dry run:      ${DRY_RUN}`);
 console.log();
 connect();
+}

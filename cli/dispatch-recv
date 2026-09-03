@@ -1,19 +1,125 @@
 #!/usr/bin/env bash
 # Drain my unread dispatch messages. Identity = my tmux pane (or $DISPATCH_TOKEN).
+#
+# ⚠ WHY THE SPOOL EXISTS (dispatch v2 P0, 2026-09-03):
+# The server's /msg/recv is DESTRUCTIVE — pullUnreadMessages() advances the
+# read cursor past the newest row it returns, so ONE call consumes the whole
+# backlog. Printing only the first N would therefore *destroy* the rest.
+# So we always persist the full drained set to a local spool FIRST, then
+# print a bounded view of it. --all / --since read back from the spool.
 set -euo pipefail
 source "$(dirname "$(readlink -f "$0")")/dispatch-common.sh"
+
+LIMIT=30
+ALL=0
+SINCE=""
+MAXBYTES="${DISPATCH_RECV_MAXBYTES:-65536}"   # 64 KB total output cap
+
+usage() {
+  cat <<USAGE
+usage: dispatch-recv [--limit N] [--all] [--since <id>]
+  --limit N     print at most N messages (default 30)
+  --all         print every message drained this call (no count limit)
+  --since <id>  replay from the local spool starting after message <id>
+  Output is also capped at ${MAXBYTES} bytes; the tail tells you what was held back.
+  Nothing is ever lost: every drained message is appended to
+  \$DISPATCH_HOME/spool-<handle>.jsonl before printing.
+USAGE
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --limit) LIMIT="${2:?--limit needs a number}"; shift 2;;
+    --limit=*) LIMIT="${1#*=}"; shift;;
+    --all) ALL=1; shift;;
+    --since) SINCE="${2:?--since needs a message id}"; shift 2;;
+    --since=*) SINCE="${1#*=}"; shift;;
+    -h|--help) usage; exit 0;;
+    *) echo "dispatch-recv: unknown argument '$1'" >&2; usage >&2; exit 2;;
+  esac
+done
+case "$LIMIT" in ''|*[!0-9]*) echo "dispatch-recv: --limit must be a non-negative integer" >&2; exit 2;; esac
+
 tok="$(_dispatch_token)"
 [ -z "$tok" ] && { echo "dispatch-recv: no token (pane '${TMUX_PANE:-?}' not registered, \$DISPATCH_TOKEN unset)"; exit 1; }
-curl -s --max-time 10 -H "Authorization: Bearer $tok" "$DISPATCH_URL/msg/recv" | python3 -c '
-import json,sys
+
+SPOOL_DIR="${DISPATCH_HOME:-$HOME/.dispatch}"
+mkdir -p "$SPOOL_DIR"
+
+curl -s --max-time 10 -H "Authorization: Bearer $tok" "$DISPATCH_URL/msg/recv" \
+| LIMIT="$LIMIT" ALL="$ALL" SINCE="$SINCE" MAXBYTES="$MAXBYTES" SPOOL_DIR="$SPOOL_DIR" python3 -c '
+import json,sys,os
+
+LIMIT=int(os.environ["LIMIT"]); ALL=os.environ["ALL"]=="1"
+SINCE=os.environ["SINCE"]; MAXB=int(os.environ["MAXBYTES"])
+SPOOL_DIR=os.environ["SPOOL_DIR"]
+
 try: d=json.load(sys.stdin)
 except Exception as e: print("dispatch-recv: bad server response:",e); sys.exit(1)
-ms=d.get("messages",[])
-if not ms: print("No new messages."); sys.exit(0)
-print(str(len(ms))+" message(s):")
-for m in ms:
+
+handle=d.get("handle") or "unknown"
+ms=d.get("messages",[]) or []
+spool=os.path.join(SPOOL_DIR,"spool-%s.jsonl"%handle)
+
+# ── persist FIRST: the server has already forgotten these ──
+if ms:
+    try:
+        with open(spool,"a",encoding="utf-8") as f:
+            for m in ms: f.write(json.dumps(m,ensure_ascii=False)+"\n")
+    except Exception as e:
+        # A spool failure must be loud: the messages exist only in this pipe.
+        print("dispatch-recv: WARNING could not write spool (%s): %s"%(spool,e))
+        print("dispatch-recv: printing everything so nothing is lost.")
+        ALL=True
+
+# ── --since replays from the spool instead of the fresh drain ──
+if SINCE:
+    rows=[]
+    try:
+        with open(spool,encoding="utf-8") as f:
+            for line in f:
+                line=line.strip()
+                if line:
+                    try: rows.append(json.loads(line))
+                    except Exception: pass
+    except FileNotFoundError:
+        print("dispatch-recv: no spool yet at %s"%spool); sys.exit(0)
+    idx=next((i for i,m in enumerate(rows) if m.get("id")==SINCE), None)
+    if idx is None:
+        print("dispatch-recv: id %s not found in spool (%d rows)"%(SINCE,len(rows))); sys.exit(1)
+    ms=rows[idx+1:]
+    if not ms: print("No messages after %s."%SINCE); sys.exit(0)
+
+if not ms:
+    print("No new messages."); sys.exit(0)
+
+def render(m):
     pri=" ["+m["priority"]+"]" if m.get("priority") not in (None,"normal") else ""
     sc="" if m.get("to_user") else " (broadcast)"
-    print("  - from "+m["from_user"]+sc+pri+" @ "+str(m.get("created_at","")))
-    print("    "+m["body"])
+    return ("  - from "+m["from_user"]+sc+pri+" @ "+str(m.get("created_at",""))+"\n"
+            +"    "+(m.get("body") or ""))
+
+total=len(ms)
+shown=[]; used=0; truncated_by=None
+cap = total if ALL else min(LIMIT,total)
+for m in ms[:cap]:
+    block=render(m)
+    if used+len(block.encode("utf-8"))>MAXB and shown:
+        truncated_by="size"; break
+    shown.append(block); used+=len(block.encode("utf-8"))+1
+if truncated_by is None and cap<total: truncated_by="limit"
+
+hdr=str(total)+" message(s)"
+if len(shown)<total: hdr+=" — showing %d"%len(shown)
+print(hdr+":")
+for b in shown: print(b)
+
+if len(shown)<total:
+    rest=total-len(shown)
+    last=shown and ms[len(shown)-1].get("id") or ""
+    why="--limit %d"%LIMIT if truncated_by=="limit" else "%d-byte output cap"%MAXB
+    print("")
+    print("  ... %d more held back by %s (nothing lost — all %d are spooled)."%(rest,why,total))
+    print("      see them with:  dispatch-recv --all   or   dispatch-recv --since %s"%last)
+    print("      spool: %s"%spool)
 '

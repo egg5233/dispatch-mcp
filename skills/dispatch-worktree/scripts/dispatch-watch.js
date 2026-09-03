@@ -70,12 +70,28 @@ const PLACEHOLDERS = (process.env.DISPATCH_PLACEHOLDERS ||
   "Write tests for @filename|Ask Codex to do anything").split("|").map((x) => x.trim()).filter(Boolean);
 // Escape hatch: DISPATCH_GUARDS_OFF=1 restores pre-v2 behaviour.
 const GUARDS_OFF = process.env.DISPATCH_GUARDS_OFF === "1";
+// dispatch v2 P1: a `low` message never wakes anyone by keystroke — it waits
+// for the agent's next natural turn (SessionStart / UserPromptSubmit hooks
+// surface it). Raise to "high" to make medium wait for the Stop hook too.
+const PRIORITY_RANK = { low: 0, medium: 1, high: 2, immediate: 3, normal: 1, urgent: 3 };
+const MIN_WAKE_PRIORITY = process.env.DISPATCH_MIN_WAKE_PRIORITY || "medium";
+const MIN_WAKE_RANK = PRIORITY_RANK[MIN_WAKE_PRIORITY] ?? 1;
+const FLEET_PATH = process.env.DISPATCH_FLEET || `${os.homedir()}/.dispatch/fleet.json`;
 
 // Expected foreground command for THIS watcher's pane. Explicit env wins;
 // otherwise derive it from registry.json (pane id -> runtime -> command).
 // Empty string = unknown -> guard A cannot run, and we FAIL CLOSED.
 function resolveExpectCmd() {
   if (EXPECT_CMD_ENV) return EXPECT_CMD_ENV;
+  // fleet.json (P1, single source of truth) first; registry.json fallback.
+  try {
+    const fleet = JSON.parse(fs.readFileSync(FLEET_PATH, "utf8"));
+    for (const ent of Object.values(fleet.handles || {})) {
+      if (ent.pane === TMUX_TARGET && ent.runtime) return RUNTIME_CMD[ent.runtime] || ent.runtime;
+    }
+  } catch {
+    // no fleet.json yet — fall through
+  }
   try {
     const reg = JSON.parse(fs.readFileSync(REGISTRY_PATH, "utf8"));
     const ent = reg[TMUX_TARGET];
@@ -313,6 +329,13 @@ function handleEvent(event) {
     console.log(`[${ts()}] fyi: ${event.type} #${id} from ${event.actor || "?"}`);
     return;
   }
+  if (event.type === "message_created" && event.message) {
+    const rank = PRIORITY_RANK[event.message.priority] ?? 1;
+    if (rank < MIN_WAKE_RANK) {
+      console.log(`[${ts()}] no wake (priority ${event.message.priority} < ${MIN_WAKE_PRIORITY}): #${id} from ${event.actor || "?"}`);
+      return;
+    }
+  }
   lastLabel = `${event.type} #${id} from ${event.actor || "?"}`;
   wakePending = true;
   console.log(`[${ts()}] wake pending (idle-gated): ${lastLabel}`);
@@ -441,6 +464,7 @@ console.log(`  tmux target:  ${TMUX_TARGET || "(dry-run)"}`);
 console.log(`  prompt:       ${PROMPT}`);
 console.log(`  min interval: ${MIN_INTERVAL}ms`);
 console.log(`  idle gate:    poll ${IDLE_POLL_MS}ms, busy marker "${BUSY_MARKER}"`);
+console.log(`  min wake:     priority ${MIN_WAKE_PRIORITY}+ (lower waits for the agent's next turn)`);
 console.log(`  guards:       ${GUARDS_OFF ? "DISABLED (DISPATCH_GUARDS_OFF=1)" : `expect cmd "${EXPECT_CMD || "<unknown — will fail closed>"}", human-idle ${HUMAN_IDLE_MS}ms`}`);
 console.log(`  reconnect:    ${RECONNECT_MS}ms`);
 console.log(`  dry run:      ${DRY_RUN}`);

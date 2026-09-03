@@ -109,7 +109,7 @@ Expect: every handle of the new project listed with its project, `pane_cmd` matc
 
 **b. One end-to-end task**
 
-From the new coordinator's window (or with its token via `DISPATCH_TOKEN`):
+From the new coordinator's window, or from any shell as the coordinator: `DISPATCH_TOKEN=<its token from fleet.json> DISPATCH_HANDLE=coord-<name> ~/.dispatch/dispatch-send …` (the CLI resolves identity from those two variables before looking at `$TMUX_PANE`):
 
 ```bash
 ~/.dispatch/dispatch-send <name>-<role> --type task --priority high --ack auto \
@@ -126,7 +126,9 @@ Expect, within about a minute:
 
 **c. Dashboard**
 
-Open `http://<server>:7900/` (login `user`). The project switcher lists the new project; selecting it scopes the inbox cards, task board, threads and fleet to that project's handles; the smoke-test task is on the board as closed. Switch back to the previous project: its view is unchanged.
+Open `http://<server>:7900/` (login `user`). The project switcher (top right) lists the new project; selecting it scopes the inbox cards, task board, threads and fleet to that project's handles; the smoke-test task is on the board as closed. Switch back to the previous project: its view is unchanged.
+
+Scripted evidence without the browser: `/api/*` needs the dashboard cookie (bearer tokens get `401 尚未登入`), but `GET /fleet` accepts a bearer token — `curl -H "Authorization: Bearer <token>" http://127.0.0.1:7900/fleet` lists every handle with its `project`, unread count and open tasks. Together with `dispatch-fleet project list` and the mirror file that is the machine-checkable record; the switcher itself is a human look.
 
 Record the evidence (the task id, the mirror path, a dashboard screenshot or the fleet check output) in the new project's `STATUS.md` as its first real entry.
 
@@ -170,6 +172,7 @@ tmux kill-session -t <name>                                    # optional; the u
 | `install-cli.sh --check` reports STALE after a pull | `~/.dispatch` was not refreshed | run `deploy/install-cli.sh` (no `--check`) |
 | server down: agents keep working, nothing delivered | hooks fail silent by design (2 s budget) | `pm2 restart dispatch`; unread messages are still on the server after restart |
 | `dispatch-init-project` re-run complains about an existing file | template copy never overwrites | that is the intended behaviour; delete the file if you want the template version |
+| `dispatch-init-project` copies fewer files than `templates/coordination/` holds | a `.gitignore` rule in the dispatch-mcp repo (root `data/`, `logs`) swallowed template files, so they never reached master (seen 2026-09-03: `data/README.md`, `logs/.gitkeep`) | in the repo: `git check-ignore -v templates/coordination/<file>`, add a `!templates/coordination/<dir>/` negation to the root `.gitignore`, `git add` the files, push, `install-cli.sh`; re-run init (it only adds what is missing) |
 
 ## Checklist (copy into the onboarding task)
 

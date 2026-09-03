@@ -263,13 +263,24 @@ function checkGuards(cb) {
   execFile(
     TMUX_BIN,
     ["display", "-p", "-t", TMUX_TARGET,
-     "#{pane_current_command}\n#{session_activity}\n#{session_name}"],
+     "#{pane_current_command}\n#{session_activity}\n#{session_name}\n#{pane_dead}\n#{pane_dead_status}"],
     (err, out) => {
       if (err) return cb(false, `tmux display failed: ${err.message}`);
       const parts = String(out).split("\n").map((x) => x.trim());
       const cmd = parts[0] || "";
       const sessAct = parseInt(parts[1] || "0", 10) || 0;
       const sessName = parts[2] || "";
+      const paneDead = parts[3] === "1";
+      const deadStatus = parts[4] || "";
+
+      // ── Guard A0: dead pane (T-20260903-16) ──
+      // A pane whose process exited (remain-on-exit) keeps reporting its LAST
+      // #{pane_current_command} — e.g. "claude" — so guard A alone would call
+      // it a live agent. Measured by pearl-infra on i5. Always on, even with
+      // GUARDS_OFF: typing into a dead pane can never do anything useful.
+      if (paneDead) {
+        return cb(false, `pane dead (exit status ${deadStatus || "?"}) — last command "${cmd}" is not running`);
+      }
 
       // ── Guard A: foreground command ──
       if (!GUARDS_OFF) {

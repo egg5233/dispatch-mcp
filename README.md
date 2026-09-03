@@ -215,7 +215,8 @@ Codex CLI 0.148.0 ships lifecycle hooks (`codex features list` → `hooks stable
 ## Tests
 
 ```bash
-node --test test/*.mjs
+node --test test/*.mjs     # server / API
+bash test/guards.sh        # live tmux: dead-pane guard in the watcher and in dispatch-fleet check
 ```
 
 `test/p1.test.mjs` boots the server on a free port with a temp DB and covers: defaults and legacy priorities, the body limit, validation, task creation/ack/report lifecycle, partial drains and priority filters, broadcast fan-out, same-second arrivals, question/answer threading and 403s, the hook digest, `/msg/wait`, presence and `/fleet`, and the legacy client shape.

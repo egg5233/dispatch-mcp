@@ -65,14 +65,15 @@ def pm2_watchers():
 
 
 def tmux_panes():
-    rc, out = sh(["tmux", "list-panes", "-a", "-F", "#{pane_id}\t#{session_name}:#{window_index}.#{pane_index}\t#{pane_current_command}\t#{window_name}"])
+    rc, out = sh(["tmux", "list-panes", "-a", "-F", "#{pane_id}\t#{session_name}:#{window_index}.#{pane_index}\t#{pane_current_command}\t#{window_name}\t#{pane_dead}\t#{pane_dead_status}"])
     res = {}
     if rc != 0:
         return res
     for line in out.splitlines():
         parts = line.split("\t")
         if len(parts) >= 3:
-            res[parts[0]] = {"target": parts[1], "cmd": parts[2], "window": parts[3] if len(parts) > 3 else ""}
+            res[parts[0]] = {"target": parts[1], "cmd": parts[2], "window": parts[3] if len(parts) > 3 else "",
+                             "dead": len(parts) > 4 and parts[4] == "1", "dead_status": parts[5] if len(parts) > 5 else ""}
     return res
 
 
@@ -290,7 +291,11 @@ def cmd_check(as_json=False):
         expect = RUNTIME_CMD.get(runtime, runtime)
         p = panes.get(pane)
         cmd = p["cmd"] if p else "(no pane)"
-        match = bool(p) and cmd == expect
+        dead = bool(p) and p.get("dead")
+        if dead:
+            cmd = "DEAD(%s)" % (p.get("dead_status") or "?")
+        # a dead pane still reports its last command (T-20260903-16) — never a match
+        match = bool(p) and not dead and p["cmd"] == expect
         w = watchers.get(h)
         wstat = (w["status"] if w else "none")
         wpane = w["pane"] if w else ""
@@ -302,6 +307,8 @@ def cmd_check(as_json=False):
         verdict = []
         if not p:
             verdict.append("PANE MISSING")
+        elif dead:
+            verdict.append("PANE DEAD (last cmd %s, exit %s)" % (p["cmd"], p.get("dead_status") or "?"))
         elif not match:
             verdict.append("AGENT NOT RUNNING (%s)" % cmd)
         if wdrift:

@@ -893,16 +893,15 @@ function normalizeAttachments(raw) {
 }
 
 // Resolve which task a report / ack refers to. Order: explicit task_id →
-// re that IS a task id → re that is a message carrying a task_id → (report
-// only) the single open task assigned to the sender, if exactly one.
-function resolveTaskFor(identity, { task_id, re, reMsg, type }) {
+// re that IS a task id → re that is a message carrying a task_id. There is
+// deliberately NO "the sender's single open task" fallback: a report about
+// something else would silently close whatever task happened to be open
+// (it did, on 2026-09-03 — a deploy note closed a freshly assigned task).
+// A report that names no task only counts toward "reported this turn".
+function resolveTaskFor(identity, { task_id, re, reMsg }) {
   if (task_id && getTask(task_id)) return task_id;
   if (re && getTask(re)) return re;
   if (reMsg && reMsg.task_id && getTask(reMsg.task_id)) return reMsg.task_id;
-  if (type === "report") {
-    const open = getOpenTasksFor(identity);
-    if (open.length === 1) return open[0].id;
-  }
   return null;
 }
 
@@ -962,7 +961,7 @@ function handleSend(identity, payload) {
   }
   if (type === "ack" && !re) return bad(400, "type=ack requires --re <message id>");
 
-  const taskId = type === "task" ? null : resolveTaskFor(identity, { task_id: p.task_id, re, reMsg, type });
+  const taskId = type === "task" ? null : resolveTaskFor(identity, { task_id: p.task_id, re, reMsg });
 
   const message = sendMessage({
     from_user: identity,

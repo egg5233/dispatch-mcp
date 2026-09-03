@@ -256,3 +256,17 @@ test("GET /msg/:id?read=1 marks the message read (dispatch-recv --full)", async 
   // a third party cannot mark it, and the sender reading it does not affect the recipient
   assert.equal((await api("other", "GET", `/msg/${m.body.id}?read=1`)).status, 403);
 });
+
+test("a report without --re/--task never touches a task, even the sender's only open one", async () => {
+  const t = await send("coord", { to: "dev", body: "only task", type: "task" });
+  const r = await send("dev", { to: "coord", body: "[DONE] something else", type: "report", state: "done" });
+  assert.equal(r.body.task_id, undefined);
+  let d = (await api("dev", "GET", "/hook/digest")).body;
+  assert.ok(d.open_tasks.find((x) => x.id === t.body.task_id), "task must still be open");
+  assert.equal(d.reported_since, undefined);
+  await send("dev", { to: "coord", body: "[DONE]", type: "report", state: "done", re: t.body.task_id });
+  d = (await api("dev", "GET", "/hook/digest")).body;
+  assert.ok(!d.open_tasks.find((x) => x.id === t.body.task_id));
+  await api("dev", "GET", "/msg/recv");
+  await api("coord", "GET", "/msg/recv");
+});

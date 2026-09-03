@@ -61,7 +61,7 @@
 `type=task` → 伺服器建 `T-YYYYMMDD-NN`（status `open`；`--ack yes` 或 `--ack auto` + high/immediate ⇒ ack_required，ack 前在板上顯示「未認領」）。
 - `dispatch-send <from> --type ack --re <task 訊息 id> "收到"` → task `acked`
 - `--type report --state continuing` → `in_progress`；`waiting`/`blocked` → 同名狀態；`done` → `closed`，report 的 body 成為 result
-- `--re` 可給任務 id 或當初那則 task 訊息 id；只持有一個 open task 時 report 可省略 `--re`（伺服器自動關聯）
+- `--re` 可給任務 id 或當初那則 task 訊息 id；**沒帶 `--re`/`--task` 的 report 不會動任何任務**（只算「這回合有回報」）——要關任務一定要指名
 - **Stop hook 會擋下**「持有 open task 且本回合沒送 report」的 session —— REPORT-ON-IDLE 現在是機械強制，不只靠自覺
 
 ## Hooks（每個 Claude session 的 settings 裡呼叫 `~/.dispatch/hook.sh <event>`）

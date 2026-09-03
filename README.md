@@ -57,7 +57,7 @@ curl -s -H "Authorization: Bearer $TOK" -H 'content-type: application/json' \
 | `attachments` | `["/abs/path", …]` or `[{path,size,sha256,name}, …]` | paths only, nothing is uploaded |
 | `force` | boolean | only with `priority=immediate`; makes the recipient's hook deny its next tool call once |
 
-Effects: `type=task` creates a task (title = first non-empty line, ≤ 80 chars; `documents` = attachments; `thread_id` = message id). `type=ack` sets the referenced message `acked` and its task `acked`. `type=report` applies `state` to the task resolved from `task_id` → `re` (task id) → `re` (message with `task_id`) → the sender's single open task; `done` closes it with the body as `result`; a referenced message becomes `closed` (done) or `answered`. Any non-ack, non-report reply to a `question`/`request_permission` marks it `answered`. Acking a `report` (or an `ack`) is refused with 400.
+Effects: `type=task` creates a task (title = first non-empty line, ≤ 80 chars; `documents` = attachments; `thread_id` = message id). `type=ack` sets the referenced message `acked` and its task `acked`. `type=report` applies `state` to the task resolved from `task_id` → `re` (task id) → `re` (message with `task_id`) — a report that names no task touches none (no "single open task" fallback; it only counts as "reported this turn"); `done` closes it with the body as `result`; a referenced message becomes `closed` (done) or `answered`. Any non-ack, non-report reply to a `question`/`request_permission` marks it `answered`. Acking a `report` (or an `ack`) is refused with 400.
 
 ### `GET /msg/recv`
 

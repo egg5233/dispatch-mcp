@@ -340,6 +340,7 @@ test("P2: dashboard login, messages/thread/inbox/tasks/settings/decisions/wake/m
   const inbox = (await api("dev", "GET", "/msg/recv")).body;
   const go = inbox.messages.find((m) => m.re === rp.body.id);
   assert.equal(go.from_user, "user");
+  assert.equal(go.priority, "high");
   assert.match(go.body, /^\[GO\]/);
   assert.equal((await dash("user", "GET", "/api/decisions")).body.requests.some((m) => m.id === rp.body.id), false);
   assert.equal((await dash("user", "POST", "/api/decide", { re: t.body.id, decision: "GO" })).status, 404);

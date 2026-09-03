@@ -1421,7 +1421,7 @@ app.post("/api/decide", requireJwt, express.json(), (req, res) => {
   const note = b.note ? " — " + String(b.note) : "";
   const r = handleSend(req.user.handle, {
     to: reqMsg.from_user, re: reqMsg.id, type: "info",
-    priority: normalizePriority(b.priority) || "high",
+    priority: b.priority ? normalizePriority(b.priority) || "high" : "high",
     body: `[${decision}] re ${reqMsg.id}${note}`,
   });
   res.status(r.status).json(r.body);

@@ -42,6 +42,25 @@ import {
 
 const PORT = process.env.PORT || 7900;
 
+// ── Timezone display ───────────────────────────────────────────────
+// Timestamps are STORED as UTC (SQLite datetime('now')); admin purge +
+// the dashboard rely on that. But the agent-facing message surfaces
+// (my_messages, /msg/recv) render created_at to the fleet's wall-clock
+// timezone (Asia/Taipei, +08) with an explicit offset so no reader ever
+// mistakes a UTC string for local time again. Storage is untouched.
+const DISPLAY_TZ = process.env.DISPATCH_TZ || "Asia/Taipei";
+const DISPLAY_TZ_SUFFIX = process.env.DISPATCH_TZ_SUFFIX || "+08";
+function toDisplayTz(utcStr) {
+  if (!utcStr || typeof utcStr !== "string") return utcStr;
+  const d = new Date(utcStr.replace(" ", "T") + "Z"); // stored value is UTC
+  if (isNaN(d.getTime())) return utcStr;
+  // sv-SE locale yields an ISO-like "YYYY-MM-DD HH:MM:SS"
+  return d.toLocaleString("sv-SE", { timeZone: DISPLAY_TZ }) + DISPLAY_TZ_SUFFIX;
+}
+function localizeMessages(msgs) {
+  return msgs.map((m) => ({ ...m, created_at: toDisplayTz(m.created_at) }));
+}
+
 // ── Event bus (for /events SSE stream) ─────────────────────────────
 //
 // In-process EventEmitter — good enough for 2-3 teammates. Every state
@@ -667,7 +686,7 @@ function createMcpServer(identity) {
     "Drain your unread messages (directed to you or broadcast). Each message is returned once — reading it marks it delivered. Call this when your watcher pokes you, or at the start of a session.",
     {},
     async () => {
-      const messages = pullUnreadMessages(identity);
+      const messages = localizeMessages(pullUnreadMessages(identity));
       if (messages.length === 0) {
         return { content: [{ type: "text", text: "📭 No unread messages." }] };
       }
@@ -892,7 +911,7 @@ app.post("/msg/send", express.json(), (req, res) => {
 app.get("/msg/recv", (req, res) => {
   const identity = httpIdentity(req, res);
   if (!identity) return;
-  const messages = pullUnreadMessages(identity);
+  const messages = localizeMessages(pullUnreadMessages(identity));
   res.json({ handle: identity, count: messages.length, messages });
 });
 

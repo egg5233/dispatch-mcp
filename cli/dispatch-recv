@@ -1,125 +1,217 @@
-#!/usr/bin/env bash
-# Drain my unread dispatch messages. Identity = my tmux pane (or $DISPATCH_TOKEN).
-#
-# ⚠ WHY THE SPOOL EXISTS (dispatch v2 P0, 2026-09-03):
-# The server's /msg/recv is DESTRUCTIVE — pullUnreadMessages() advances the
-# read cursor past the newest row it returns, so ONE call consumes the whole
-# backlog. Printing only the first N would therefore *destroy* the rest.
-# So we always persist the full drained set to a local spool FIRST, then
-# print a bounded view of it. --all / --since read back from the spool.
-set -euo pipefail
-source "$(dirname "$(readlink -f "$0")")/dispatch-common.sh"
+#!/usr/bin/env python3
+"""Read my dispatch messages.
 
-LIMIT=30
-ALL=0
-SINCE=""
-MAXBYTES="${DISPATCH_RECV_MAXBYTES:-65536}"   # 64 KB total output cap
+usage: dispatch-recv [--limit N] [--priority high+] [--all] [--since <id>]
+                     [--full [<id>[,<id>...]]] [--peek] [--json]
 
-usage() {
-  cat <<USAGE
-usage: dispatch-recv [--limit N] [--all] [--since <id>]
-  --limit N     print at most N messages (default 30)
-  --all         print every message drained this call (no count limit)
-  --since <id>  replay from the local spool starting after message <id>
-  Output is also capped at ${MAXBYTES} bytes; the tail tells you what was held back.
-  Nothing is ever lost: every drained message is appended to
-  \$DISPATCH_HOME/spool-<handle>.jsonl before printing.
-USAGE
-}
+  (default)        drain up to --limit (30) unread messages, one summary line
+                   each: id  time  from→to  type  priority  [flags]  first 120 chars.
+                   Whatever is not drained STAYS UNREAD on the server (the
+                   server only marks what it returned) — a limit never loses
+                   anything, it just defers it to the next call.
+  --priority P+    drain only priority P and above (low|medium|high|immediate)
+  --all            no count limit (output is still capped at 64 KB; the tail
+                   says what was held back and how to see it)
+  --since <id>     show everything after message <id> (non-destructive)
+  --full           show full bodies instead of one-liners for this drain
+  --full <ids>     print those messages in full (no drain; comma-separated)
+  --peek           look without consuming (hooks use this; you rarely need it)
+  --json           raw JSON instead of text
 
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --limit) LIMIT="${2:?--limit needs a number}"; shift 2;;
-    --limit=*) LIMIT="${1#*=}"; shift;;
-    --all) ALL=1; shift;;
-    --since) SINCE="${2:?--since needs a message id}"; shift 2;;
-    --since=*) SINCE="${1#*=}"; shift;;
-    -h|--help) usage; exit 0;;
-    *) echo "dispatch-recv: unknown argument '$1'" >&2; usage >&2; exit 2;;
-  esac
-done
-case "$LIMIT" in ''|*[!0-9]*) echo "dispatch-recv: --limit must be a non-negative integer" >&2; exit 2;; esac
+Every drained message is also appended to ~/.dispatch/spool-<handle>.jsonl,
+so nothing printed here is ever the only copy.
+"""
+import json
+import os
+import sys
 
-tok="$(_dispatch_token)"
-[ -z "$tok" ] && { echo "dispatch-recv: no token (pane '${TMUX_PANE:-?}' not registered, \$DISPATCH_TOKEN unset)"; exit 1; }
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import dispatchlib as D  # noqa: E402
 
-SPOOL_DIR="${DISPATCH_HOME:-$HOME/.dispatch}"
-mkdir -p "$SPOOL_DIR"
+USAGE = __doc__.strip()
+MAXBYTES = int(os.environ.get("DISPATCH_RECV_MAXBYTES", "65536"))
 
-curl -s --max-time 10 -H "Authorization: Bearer $tok" "$DISPATCH_URL/msg/recv" \
-| LIMIT="$LIMIT" ALL="$ALL" SINCE="$SINCE" MAXBYTES="$MAXBYTES" SPOOL_DIR="$SPOOL_DIR" python3 -c '
-import json,sys,os
 
-LIMIT=int(os.environ["LIMIT"]); ALL=os.environ["ALL"]=="1"
-SINCE=os.environ["SINCE"]; MAXB=int(os.environ["MAXBYTES"])
-SPOOL_DIR=os.environ["SPOOL_DIR"]
+def parse(argv):
+    o = {"limit": 30, "priority": "low", "all": False, "since": None, "full": None,
+         "full_ids": [], "peek": False, "json": False}
+    i = 0
+    while i < len(argv):
+        a = argv[i]
 
-try: d=json.load(sys.stdin)
-except Exception as e: print("dispatch-recv: bad server response:",e); sys.exit(1)
+        def val(name):
+            nonlocal i
+            if i + 1 >= len(argv):
+                D.die("dispatch-recv: %s needs a value" % name, 2)
+            i += 1
+            return argv[i]
+        if a.startswith("--") and "=" in a:
+            k, v = a[2:].split("=", 1)
+            argv[i] = "--" + k
+            argv.insert(i + 1, v)
+            continue
+        if a in ("--limit", "-n"):
+            v = val(a)
+            if not v.isdigit():
+                D.die("dispatch-recv: --limit must be a non-negative integer", 2)
+            o["limit"] = int(v)
+        elif a in ("--priority", "-p"):
+            try:
+                o["priority"] = D.parse_min_priority(val(a))
+            except D.DispatchError as e:
+                D.die("dispatch-recv: %s" % e, 2)
+        elif a == "--all":
+            o["all"] = True
+        elif a == "--since":
+            o["since"] = val(a)
+        elif a == "--full":
+            if i + 1 < len(argv) and not argv[i + 1].startswith("-"):
+                i += 1
+                if argv[i] == "all":
+                    o["full"] = True
+                else:
+                    o["full_ids"] = [x for x in argv[i].split(",") if x]
+            else:
+                o["full"] = True
+        elif a == "--peek":
+            o["peek"] = True
+        elif a == "--json":
+            o["json"] = True
+        elif a in ("-h", "--help"):
+            print(USAGE)
+            sys.exit(0)
+        else:
+            D.die("dispatch-recv: unknown argument '%s'\n%s" % (a, USAGE), 2)
+        i += 1
+    return o
 
-handle=d.get("handle") or "unknown"
-ms=d.get("messages",[]) or []
-spool=os.path.join(SPOOL_DIR,"spool-%s.jsonl"%handle)
 
-# ── persist FIRST: the server has already forgotten these ──
-if ms:
+def print_bounded(blocks, total, spool, note_more=None, full=False):
+    """Print blocks under the byte cap; say what was held back."""
+    shown, used = [], 0
+    for b in blocks:
+        n = len(b.encode("utf-8")) + 1
+        if used + n > MAXBYTES and shown:
+            break
+        shown.append(b)
+        used += n
+    for b in shown:
+        print(b)
+    held = total - len(shown)
+    if held > 0:
+        print("")
+        print("  … %d more held back by the %d-byte output cap (nothing lost — all are in the spool)." % (held, MAXBYTES))
+        print("      spool: %s   (dispatch-recv --since <last id shown> replays from the server)" % spool)
+    if note_more:
+        print("")
+        print(note_more)
+
+
+def main(argv):
+    o = parse(list(argv))
+    handle, tok = D.identity()
+    if not tok:
+        D.die("dispatch-recv: no token (pane '%s' not registered, $DISPATCH_TOKEN unset)" % os.environ.get("TMUX_PANE", "?"))
+
+    # ── --full <ids>: fetch and print, no drain ──
+    if o["full_ids"]:
+        rc = 0
+        for mid in o["full_ids"]:
+            try:
+                status, d = D.http("GET", "/msg/" + mid, token=tok)
+            except D.DispatchError as e:
+                # fall back to the local spool
+                rows = [m for m in D.spool_read(handle) if m.get("id") == mid]
+                if rows:
+                    print(render(rows[-1], o, True))
+                    continue
+                D.die("dispatch-recv: %s" % e)
+            if status != 200 or not d:
+                print("dispatch-recv: %s: %s" % (mid, (d or {}).get("error") or "HTTP %s" % status))
+                rc = 1
+                continue
+            print(render(d, o, True))
+        return rc
+
+    # ── --since <id>: non-destructive history ──
+    if o["since"]:
+        try:
+            status, d = D.http("GET", "/msg/history?since=%s&limit=%d" % (o["since"], o["limit"] if not o["all"] else 500), token=tok)
+        except D.DispatchError as e:
+            rows = D.spool_read(handle)
+            idx = next((i for i, m in enumerate(rows) if m.get("id") == o["since"]), None)
+            if idx is None:
+                D.die("dispatch-recv: %s; and id %s not in local spool" % (e, o["since"]))
+            ms = rows[idx + 1:]
+            print("(server unreachable — replaying %d from local spool)" % len(ms))
+            status, d = 200, {"messages": ms, "count": len(ms)}
+        if status != 200 or not d:
+            D.die("dispatch-recv: %s" % ((d or {}).get("error") or "HTTP %s" % status))
+        ms = d.get("messages") or []
+        if o["json"]:
+            print(json.dumps(d, ensure_ascii=False))
+            return 0
+        if not ms:
+            print("No messages after %s." % o["since"])
+            return 0
+        print("%d message(s) after %s:" % (len(ms), o["since"]))
+        print_bounded([render(m, o) for m in ms], len(ms), D.spool_path(handle))
+        return 0
+
+    # ── default: drain (or peek) ──
+    q = "/msg/recv?limit=%d&priority=%s" % (0 if o["all"] else o["limit"], o["priority"])
+    if o["peek"]:
+        q += "&peek=1"
     try:
-        with open(spool,"a",encoding="utf-8") as f:
-            for m in ms: f.write(json.dumps(m,ensure_ascii=False)+"\n")
-    except Exception as e:
-        # A spool failure must be loud: the messages exist only in this pipe.
-        print("dispatch-recv: WARNING could not write spool (%s): %s"%(spool,e))
-        print("dispatch-recv: printing everything so nothing is lost.")
-        ALL=True
+        status, d = D.http("GET", q, token=tok)
+    except D.DispatchError as e:
+        D.die("dispatch-recv: %s" % e)
+    if status != 200 or not d:
+        D.die("dispatch-recv: %s" % ((d or {}).get("error") or "HTTP %s" % status))
+    ms = d.get("messages") or []
+    handle = d.get("handle") or handle
+    if ms and not o["peek"]:
+        if not D.spool_append(handle, ms):
+            print("dispatch-recv: WARNING could not write spool %s — printing everything so nothing is lost." % D.spool_path(handle))
+            o["all"] = True
+            o["full"] = True
+    if o["json"]:
+        print(json.dumps(d, ensure_ascii=False))
+        return 0
+    remaining = d.get("remaining") or 0
+    if not ms:
+        if remaining:
+            print("No messages at %s+; %d unread at lower priority (dispatch-recv to drain them)." % (o["priority"], remaining))
+        else:
+            print("No new messages.")
+        return 0
+    hdr = "%d message(s)" % len(ms)
+    if o["peek"]:
+        hdr += " (peek — still unread)"
+    if o["priority"] != "low":
+        hdr += " at %s+" % o["priority"]
+    note = None
+    if remaining:
+        by = d.get("remaining_by_priority") or {}
+        bys = ", ".join("%s %d" % (k, v) for k, v in by.items() if v)
+        hdr += " — %d more still unread on the server" % remaining
+        note = ("  %d more unread%s. They stay queued until you drain them: dispatch-recv%s"
+                % (remaining, " (%s)" % bys if bys else "",
+                   "" if o["priority"] == "low" else "  (this call was filtered to %s+)" % o["priority"]))
+    print(hdr + ":")
+    print_bounded([render(m, o) for m in ms], len(ms), D.spool_path(handle), note_more=note)
+    if not o["full"]:
+        long_ones = [m for m in ms if len(" ".join((m.get("body") or "").split())) > 120]
+        if long_ones:
+            print("  full text: dispatch-recv --full %s" % ",".join(m["id"] for m in long_ones[:5]) + ("  (or --full all on the next drain)" if len(long_ones) > 5 else ""))
+    return 0
 
-# ── --since replays from the spool instead of the fresh drain ──
-if SINCE:
-    rows=[]
-    try:
-        with open(spool,encoding="utf-8") as f:
-            for line in f:
-                line=line.strip()
-                if line:
-                    try: rows.append(json.loads(line))
-                    except Exception: pass
-    except FileNotFoundError:
-        print("dispatch-recv: no spool yet at %s"%spool); sys.exit(0)
-    idx=next((i for i,m in enumerate(rows) if m.get("id")==SINCE), None)
-    if idx is None:
-        print("dispatch-recv: id %s not found in spool (%d rows)"%(SINCE,len(rows))); sys.exit(1)
-    ms=rows[idx+1:]
-    if not ms: print("No messages after %s."%SINCE); sys.exit(0)
 
-if not ms:
-    print("No new messages."); sys.exit(0)
+def render(m, o, force_full=False):
+    if force_full or o["full"]:
+        return D.render_full(m) + "\n"
+    return D.summary_line(m)
 
-def render(m):
-    pri=" ["+m["priority"]+"]" if m.get("priority") not in (None,"normal") else ""
-    sc="" if m.get("to_user") else " (broadcast)"
-    return ("  - from "+m["from_user"]+sc+pri+" @ "+str(m.get("created_at",""))+"\n"
-            +"    "+(m.get("body") or ""))
 
-total=len(ms)
-shown=[]; used=0; truncated_by=None
-cap = total if ALL else min(LIMIT,total)
-for m in ms[:cap]:
-    block=render(m)
-    if used+len(block.encode("utf-8"))>MAXB and shown:
-        truncated_by="size"; break
-    shown.append(block); used+=len(block.encode("utf-8"))+1
-if truncated_by is None and cap<total: truncated_by="limit"
-
-hdr=str(total)+" message(s)"
-if len(shown)<total: hdr+=" — showing %d"%len(shown)
-print(hdr+":")
-for b in shown: print(b)
-
-if len(shown)<total:
-    rest=total-len(shown)
-    last=shown and ms[len(shown)-1].get("id") or ""
-    why="--limit %d"%LIMIT if truncated_by=="limit" else "%d-byte output cap"%MAXB
-    print("")
-    print("  ... %d more held back by %s (nothing lost — all %d are spooled)."%(rest,why,total))
-    print("      see them with:  dispatch-recv --all   or   dispatch-recv --since %s"%last)
-    print("      spool: %s"%spool)
-'
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

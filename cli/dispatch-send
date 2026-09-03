@@ -1,20 +1,176 @@
-#!/usr/bin/env bash
-# Send a message.  Usage: dispatch-send <to|all> <body...>   [PRIORITY=high]
-set -euo pipefail
-source "$(dirname "$(readlink -f "$0")")/dispatch-common.sh"
-tok="$(_dispatch_token)"
-[ -z "$tok" ] && { echo "dispatch-send: no token (pane '${TMUX_PANE:-?}' not registered, \$DISPATCH_TOKEN unset)"; exit 1; }
-to="${1:-}"; shift || true
-body="$*"
-{ [ -z "$to" ] || [ -z "$body" ]; } && { echo "usage: dispatch-send <to|all> <body...>"; exit 2; }
-[ "$to" = "all" ] && to=""
-payload="$(python3 -c 'import json,os,sys;print(json.dumps({"to":(sys.argv[1] or None),"body":sys.argv[2],"priority":os.environ.get("PRIORITY","normal")}))' "$to" "$body")"
-curl -s --max-time 10 -H "Authorization: Bearer $tok" -H 'content-type: application/json' -d "$payload" "$DISPATCH_URL/msg/send" | python3 -c '
-import json,sys
-try: d=json.load(sys.stdin)
-except Exception as e: print("dispatch-send: bad server response:",e); sys.exit(1)
-if d.get("delivered"):
-    print("sent -> "+str(d.get("to"))+"  (id "+str(d.get("id"))+")")
-else:
-    print("dispatch-send FAILED: "+str(d.get("error") or d)); sys.exit(1)
-'
+#!/usr/bin/env python3
+"""Send a dispatch message.
+
+usage: dispatch-send <to|all> [--type T] [--priority P] [--ack yes|no|auto]
+                     [--re <id>] [--task <T-id>] [--state S] [--attach <path>]...
+                     [--force] [--json] "<body>"
+
+No flags = type info, priority medium. $PRIORITY=high is still honoured as a
+legacy default. Body is everything that is not a flag (joined with spaces),
+max 1,500 characters — put longer material in a file and --attach it.
+"""
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import dispatchlib as D  # noqa: E402
+
+USAGE = __doc__.strip()
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        print(USAGE)
+        return 0 if argv else 2
+    to = argv[0]
+    args = argv[1:]
+    opts = {"type": "info", "priority": os.environ.get("PRIORITY") or "medium", "ack": "no",
+            "re": None, "task": None, "state": None, "attach": [], "force": False, "json": False}
+    body_parts = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        def val():
+            nonlocal i
+            if i + 1 >= len(args):
+                D.die("dispatch-send: %s needs a value" % a, 2)
+            i += 1
+            return args[i]
+        if a.startswith("--") and "=" in a:
+            k, v = a[2:].split("=", 1)
+            args[i] = "--" + k
+            args.insert(i + 1, v)
+            continue
+        if a in ("--type", "-t"):
+            opts["type"] = val()
+        elif a in ("--priority", "-p"):
+            opts["priority"] = val()
+        elif a == "--ack":
+            opts["ack"] = val()
+        elif a == "--re":
+            opts["re"] = val()
+        elif a == "--task":
+            opts["task"] = val()
+        elif a == "--state":
+            opts["state"] = val()
+        elif a in ("--attach", "-a"):
+            opts["attach"].append(val())
+        elif a == "--force":
+            opts["force"] = True
+        elif a == "--json":
+            opts["json"] = True
+        elif a == "--":
+            body_parts.extend(args[i + 1:])
+            break
+        elif a.startswith("--"):
+            D.die("dispatch-send: unknown flag %s\n%s" % (a, USAGE), 2)
+        else:
+            body_parts.append(a)
+        i += 1
+    body = " ".join(body_parts).strip()
+    if not to or not body:
+        D.die(USAGE, 2)
+
+    # local validation — fail fast with the same vocabulary the server uses
+    if opts["type"] not in D.TYPES:
+        D.die("dispatch-send: --type must be one of %s" % "|".join(D.TYPES), 2)
+    try:
+        pri = D.parse_min_priority(opts["priority"])
+    except D.DispatchError as e:
+        D.die("dispatch-send: %s" % e, 2)
+    if opts["ack"] not in D.ACKS:
+        D.die("dispatch-send: --ack must be one of %s" % "|".join(D.ACKS), 2)
+    if opts["state"] and opts["state"] not in D.STATES:
+        D.die("dispatch-send: --state must be one of %s" % "|".join(D.STATES), 2)
+    if opts["state"] and opts["type"] != "report":
+        D.die("dispatch-send: --state only makes sense with --type report", 2)
+    if opts["force"] and pri != "immediate":
+        D.die("dispatch-send: --force requires --priority immediate", 2)
+    n = len(body)
+    if n > 1500:
+        D.die("dispatch-send: body is %d chars (limit 1500). Put the detail in a file and pass --attach <path>." % n, 2)
+
+    attachments = []
+    for p in opts["attach"]:
+        ap = os.path.abspath(os.path.expanduser(p))
+        if not os.path.isfile(ap):
+            D.die("dispatch-send: --attach %s: not a readable file" % p, 2)
+        try:
+            attachments.append({"path": ap, "size": os.path.getsize(ap), "sha256": D.sha256_file(ap)[:16]})
+        except OSError as e:
+            D.die("dispatch-send: --attach %s: %s" % (p, e), 2)
+
+    handle, tok = D.identity()
+    if not tok:
+        D.die("dispatch-send: no token (pane '%s' not registered, $DISPATCH_TOKEN unset)" % os.environ.get("TMUX_PANE", "?"))
+
+    payload = {
+        "to": None if to == "all" else to,
+        "body": body,
+        "priority": pri,
+        "type": opts["type"],
+        "ack": opts["ack"],
+        "re": opts["re"],
+        "task_id": opts["task"],
+        "state": opts["state"],
+        "attachments": attachments,
+        "force": opts["force"],
+    }
+    try:
+        status, d = D.http("POST", "/msg/send", payload, token=tok, timeout=10)
+    except D.DispatchError as e:
+        D.die("dispatch-send FAILED: %s" % e)
+    if opts["json"]:
+        print(json.dumps(d, ensure_ascii=False))
+    if not d or not d.get("delivered"):
+        if not opts["json"]:
+            print("dispatch-send FAILED: %s" % ((d or {}).get("error") or d or ("HTTP %s" % status)))
+        return 1
+    if not opts["json"]:
+        extra = []
+        if d.get("task_id"):
+            t = d.get("task") or {}
+            extra.append("task %s%s" % (d["task_id"], " (%s)" % t["status"] if t.get("status") else ""))
+        if d.get("ack_required") and opts["type"] != "ack":
+            extra.append("ack required")
+        if d.get("acked"):
+            extra.append("acked %s" % d["acked"])
+        if d.get("answered"):
+            extra.append("answered %s" % d["answered"])
+        line = "sent -> %s  (id %s" % (d.get("to"), d.get("id"))
+        if opts["type"] != "info" or pri != "medium":
+            line += ", %s/%s" % (opts["type"], pri)
+        line += ")"
+        if extra:
+            line += "  " + "; ".join(extra)
+        print(line)
+        # Idle-wake hint: if the recipient is a Claude session that is idle,
+        # SendMessage is the native way to start its next turn now.
+        wake_hint(to)
+    return 0
+
+
+def wake_hint(to):
+    if to == "all":
+        return
+    fleet = D.load_fleet()
+    pane = None
+    runtime = None
+    if fleet and isinstance(fleet.get("handles"), dict) and to in fleet["handles"]:
+        pane = fleet["handles"][to].get("pane")
+        runtime = fleet["handles"][to].get("runtime")
+    else:
+        for p, ent in D.load_registry().items():
+            if ent.get("handle") == to:
+                pane, runtime = p, ent.get("runtime")
+                break
+    if runtime and runtime != "claude":
+        return
+    s = D.session_for_pane(pane) if pane else None
+    if s and s.get("status") == "idle":
+        print("  hint: %s is idle (Claude session \"%s\") — to wake it now use SendMessage(to=\"%s\")" % (to, s["name"], s["name"]))
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

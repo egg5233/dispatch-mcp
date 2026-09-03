@@ -1,0 +1,244 @@
+#!/usr/bin/env python3
+"""Fleet registry + health check.
+
+usage: dispatch-fleet check            audit every handle (tmux pane, watcher, Claude session, server inbox)
+       dispatch-fleet sync [--write]   build fleet.json from registry.json + pm2 + ~/.claude/sessions
+                                       (--write also regenerates registry.json from fleet.json for old consumers)
+       dispatch-fleet show             print fleet.json
+
+fleet.json is the single source of truth: handle -> token / runtime / pane /
+session_name / cwd / watcher. registry.json (pane -> handle/token/runtime)
+is kept as a derived compatibility file for dispatch-common.sh and the
+watcher's expected-command lookup.
+"""
+import json
+import os
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import dispatchlib as D  # noqa: E402
+
+RUNTIME_CMD = {"claude": "claude", "codex": "node"}
+FLEET_PATH = os.path.join(D.CFG, "fleet.json")
+REG_PATH = os.path.join(D.CFG, "registry.json")
+
+
+def sh(args, timeout=5):
+    try:
+        r = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, r.stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return 1, ""
+
+
+def pm2_watchers():
+    rc, out = sh(["pm2", "jlist"], timeout=15)
+    res = {}
+    if rc != 0 or not out:
+        return res
+    try:
+        for p in json.loads(out):
+            name = p.get("name", "")
+            if not name.startswith("watch-"):
+                continue
+            env = p.get("pm2_env", {}) or {}
+            res[name[len("watch-"):]] = {
+                "name": name,
+                "status": env.get("status"),
+                "pane": (env.get("env") or {}).get("TMUX_TARGET") or env.get("TMUX_TARGET"),
+                "restarts": env.get("restart_time"),
+            }
+    except ValueError:
+        pass
+    return res
+
+
+def tmux_panes():
+    rc, out = sh(["tmux", "list-panes", "-a", "-F", "#{pane_id}\t#{session_name}:#{window_index}.#{pane_index}\t#{pane_current_command}\t#{window_name}"])
+    res = {}
+    if rc != 0:
+        return res
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 3:
+            res[parts[0]] = {"target": parts[1], "cmd": parts[2], "window": parts[3] if len(parts) > 3 else ""}
+    return res
+
+
+def build_fleet():
+    reg = D.load_registry()
+    old = D.load_fleet() or {}
+    watchers = pm2_watchers()
+    sessions = {s["pane"]: s for s in D.claude_sessions() if s["pane"]}
+    handles = {}
+    # start from the existing fleet.json so hand-edited fields survive
+    for h, ent in (old.get("handles") or {}).items():
+        handles[h] = dict(ent)
+    for pane, ent in reg.items():
+        h = ent.get("handle")
+        if not h:
+            continue
+        cur = handles.setdefault(h, {})
+        cur.setdefault("token", ent.get("token"))
+        cur["runtime"] = ent.get("runtime") or cur.get("runtime") or "claude"
+        cur["pane"] = pane
+    for h, cur in handles.items():
+        w = watchers.get(h)
+        if w:
+            cur["watcher"] = w["name"]
+            cur["watcher_pane"] = w["pane"]
+        s = sessions.get(cur.get("pane"))
+        if s:
+            cur["session_name"] = s["name"]
+            cur["cwd"] = s["cwd"]
+            cur["session_id"] = s["session_id"]
+    return {
+        "version": 1,
+        "generated_at": time.strftime("%Y-%m-%d %H:%M:%S%z"),
+        "url": old.get("url") or D.server_url(),
+        "tmux_tmpdir": old.get("tmux_tmpdir") or os.environ.get("TMUX_TMPDIR") or "/var/solana/data/tmp",
+        "handles": dict(sorted(handles.items())),
+    }
+
+
+def cmd_sync(write):
+    fleet = build_fleet()
+    os.makedirs(D.CFG, exist_ok=True)
+    tmp = FLEET_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(fleet, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    os.replace(tmp, FLEET_PATH)
+    print("fleet.json: %d handles -> %s" % (len(fleet["handles"]), FLEET_PATH))
+    if write:
+        reg = {}
+        for h, ent in fleet["handles"].items():
+            if ent.get("pane") and ent.get("token"):
+                reg[ent["pane"]] = {"handle": h, "token": ent["token"], "runtime": ent.get("runtime", "claude")}
+        if os.path.exists(REG_PATH):
+            bak = REG_PATH + ".bak-fleet-%d" % int(time.time())
+            os.replace(REG_PATH, bak)
+            print("registry.json backed up to %s" % bak)
+        with open(REG_PATH, "w", encoding="utf-8") as f:
+            json.dump(reg, f, indent=2)
+            f.write("\n")
+        print("registry.json regenerated: %d panes" % len(reg))
+    return 0
+
+
+def cmd_show():
+    fleet = D.load_fleet()
+    if not fleet:
+        D.die("no fleet.json at %s — run: dispatch-fleet sync" % FLEET_PATH)
+    red = json.loads(json.dumps(fleet))
+    for ent in red.get("handles", {}).values():
+        if ent.get("token"):
+            ent["token"] = ent["token"][:12] + "…"
+    print(json.dumps(red, indent=2, ensure_ascii=False))
+    return 0
+
+
+def cmd_check(as_json=False):
+    fleet = D.load_fleet() or build_fleet()
+    panes = tmux_panes()
+    watchers = pm2_watchers()
+    sessions = {s["pane"]: s for s in D.claude_sessions() if s["pane"]}
+    server = {}
+    server_err = None
+    _, tok = D.identity()
+    if not tok:
+        # any fleet token will do for /fleet — pick the first
+        for ent in fleet.get("handles", {}).values():
+            if ent.get("token"):
+                tok = ent["token"]
+                break
+    if tok:
+        try:
+            st, d = D.http("GET", "/fleet", token=tok, timeout=5)
+            if st == 200 and d:
+                server = {r["handle"]: r for r in d.get("handles", [])}
+            else:
+                server_err = (d or {}).get("error") or "HTTP %s" % st
+        except D.DispatchError as e:
+            server_err = str(e)
+    rows = []
+    problems = 0
+    for h, ent in sorted(fleet.get("handles", {}).items()):
+        pane = ent.get("pane") or ""
+        runtime = ent.get("runtime") or "?"
+        expect = RUNTIME_CMD.get(runtime, runtime)
+        p = panes.get(pane)
+        cmd = p["cmd"] if p else "(no pane)"
+        match = bool(p) and cmd == expect
+        w = watchers.get(h)
+        wstat = (w["status"] if w else "none")
+        wpane = w["pane"] if w else ""
+        wdrift = bool(w) and wpane != pane
+        s = sessions.get(pane)
+        sname = s["name"] if s else ""
+        sstat = s["status"] if s else ""
+        sv = server.get(h) or {}
+        verdict = []
+        if not p:
+            verdict.append("PANE MISSING")
+        elif not match:
+            verdict.append("AGENT NOT RUNNING (%s)" % cmd)
+        if wdrift:
+            verdict.append("WATCHER PANE %s≠%s" % (wpane, pane))
+        if w and wstat != "online":
+            verdict.append("watcher %s" % wstat)
+        if runtime == "claude" and p and match and not s:
+            verdict.append("no Claude session record")
+        if verdict:
+            problems += 1
+        rows.append({
+            "handle": h, "pane": pane, "runtime": runtime, "pane_cmd": cmd, "expect": expect,
+            "match": match, "watcher": wstat, "watcher_pane": wpane,
+            "session": sname, "session_status": sstat,
+            "state": sv.get("state"), "unread": sv.get("unread"), "unread_high_plus": sv.get("unread_high_plus"),
+            "oldest_unread_at": sv.get("oldest_unread_at"), "open_tasks": sv.get("open_tasks"),
+            "unacked_tasks": sv.get("unacked_tasks"), "verdict": "; ".join(verdict) or "ok",
+        })
+    if as_json:
+        print(json.dumps({"server_error": server_err, "rows": rows}, ensure_ascii=False, indent=2))
+        return 1 if problems else 0
+    cols = [("handle", 13), ("pane", 5), ("runtime", 7), ("pane_cmd", 9), ("match", 5),
+            ("watcher", 8), ("session", 30), ("session_status", 6), ("state", 8),
+            ("unread", 6), ("open_tasks", 5), ("verdict", 0)]
+    hdr = "  ".join((c if w == 0 else c.ljust(w))[:w or 99] for c, w in cols)
+    print(hdr)
+    print("-" * len(hdr))
+    for r in rows:
+        cells = []
+        for c, w in cols:
+            v = r.get(c)
+            if c == "match":
+                v = "yes" if v else "NO"
+            if c == "unread" and r.get("unread_high_plus"):
+                v = "%s(%s!)" % (v, r["unread_high_plus"])
+            v = "" if v is None else str(v)
+            cells.append(v if w == 0 else v.ljust(w)[:w])
+        print("  ".join(cells).rstrip())
+    print("")
+    print("%d handle(s), %d with problems.%s" % (len(rows), problems, "  server: %s" % server_err if server_err else ""))
+    return 1 if problems else 0
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        return 0 if argv else 2
+    cmd = argv[0]
+    if cmd == "check":
+        return cmd_check(as_json="--json" in argv)
+    if cmd == "sync":
+        return cmd_sync(write="--write" in argv)
+    if cmd == "show":
+        return cmd_show()
+    D.die("dispatch-fleet: unknown command %s\n%s" % (cmd, __doc__.strip()), 2)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

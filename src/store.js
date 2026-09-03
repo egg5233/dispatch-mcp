@@ -3,9 +3,11 @@ import { randomUUID } from "crypto";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 import { mkdirSync } from "fs";
+import { localDateStamp, utcNow } from "./tz.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const DATA_DIR = join(__dirname, "..", "data");
+// DISPATCH_DATA_DIR lets tests (and a staging copy) point at another DB.
+const DATA_DIR = process.env.DISPATCH_DATA_DIR || join(__dirname, "..", "data");
 mkdirSync(DATA_DIR, { recursive: true });
 
 const db = new Database(join(DATA_DIR, "dispatch.db"));
@@ -90,6 +92,20 @@ db.exec(`
   );
   CREATE INDEX IF NOT EXISTS idx_messages_inbox
     ON messages (to_user, delivered_at);
+
+  -- Per-recipient read set (dispatch v2 P1). The users.last_message_seen_at
+  -- cursor alone forced /msg/recv to drain the WHOLE backlog in one go
+  -- (a --limit could only hide, never defer). With an explicit read set a
+  -- drain can be partial (limit / min-priority) and whatever it did not
+  -- return simply stays unread on the server. The cursor is kept as a
+  -- lower bound so the read set stays small: once a drain returns
+  -- everything, the cursor advances and older read rows are pruned.
+  CREATE TABLE IF NOT EXISTS message_reads (
+    handle TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    read_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (handle, message_id)
+  );
 `);
 
 // ── Migrations for DBs that predate the columns above ──────────────
@@ -133,13 +149,96 @@ migrateColumn("tasks", "head_branch", "head_branch TEXT");
 migrateColumn("tasks", "head_commit", "head_commit TEXT");
 migrateColumn("tasks", "pr_url", "pr_url TEXT");
 
+// ── dispatch v2 P1 (2026-09-03): typed messages + task linkage ─────
+// messages: type / ack / threading / lifecycle
+migrateColumn("messages", "type", "type TEXT NOT NULL DEFAULT 'info'");
+migrateColumn("messages", "ack", "ack TEXT NOT NULL DEFAULT 'no'");
+migrateColumn("messages", "re", "re TEXT");
+migrateColumn("messages", "task_id", "task_id TEXT");
+migrateColumn("messages", "state", "state TEXT");
+migrateColumn("messages", "attachments", "attachments TEXT NOT NULL DEFAULT '[]'");
+migrateColumn("messages", "status", "status TEXT NOT NULL DEFAULT 'queued'");
+migrateColumn("messages", "acked_at", "acked_at TEXT");
+migrateColumn("messages", "closed_at", "closed_at TEXT");
+// `force` is not in the spec's column list but §4 needs it: only a sender
+// who explicitly passed --force gets the PreToolUse *deny* treatment.
+migrateColumn("messages", "force", "force INTEGER NOT NULL DEFAULT 0");
+// tasks: ack tracking + documents + the message thread that spawned it
+migrateColumn("tasks", "ack_required", "ack_required INTEGER NOT NULL DEFAULT 0");
+migrateColumn("tasks", "acked_at", "acked_at TEXT");
+migrateColumn("tasks", "documents", "documents TEXT NOT NULL DEFAULT '[]'");
+migrateColumn("tasks", "thread_id", "thread_id TEXT");
+// presence: hook-reported turn state (busy / turn_end / idle / offline)
+migrateColumn("presence", "state", "state TEXT");
+migrateColumn("presence", "state_at", "state_at TEXT");
+migrateColumn("presence", "session", "session TEXT");
+
+// Priority vocabulary is now low | medium | high | immediate. Legacy rows
+// used normal / urgent; map them once so ORDER BY and filters stay simple.
+db.exec(`UPDATE messages SET priority = 'medium'    WHERE priority = 'normal'`);
+db.exec(`UPDATE messages SET priority = 'immediate' WHERE priority = 'urgent'`);
+db.exec(`UPDATE tasks    SET priority = 'medium'    WHERE priority = 'normal'`);
+db.exec(`UPDATE tasks    SET priority = 'immediate' WHERE priority = 'urgent'`);
+
+// One-time backfill for rows that predate `status`: anything at or before a
+// recipient's read cursor was already drained → delivered. Broadcasts are
+// marked delivered too (no per-recipient truth exists for them pre-P1).
+// Guarded by a settings flag so it runs exactly once.
+{
+  const flag = db.prepare(`SELECT value FROM settings WHERE key = 'migr_p1_msg_status'`).get();
+  if (!flag) {
+    db.exec(`
+      UPDATE messages SET status = 'delivered', delivered_at = COALESCE(delivered_at, created_at)
+       WHERE status = 'queued'
+         AND (
+           to_user IS NULL
+           OR created_at <= (SELECT last_message_seen_at FROM users WHERE handle = messages.to_user)
+         );
+    `);
+    // The unread query now uses created_at >= cursor (see getUnreadMessages)
+    // so a message sharing the cursor's second can't be skipped. Seed the
+    // read set with rows sitting exactly ON each cursor so they aren't
+    // re-delivered once.
+    db.exec(`
+      INSERT OR IGNORE INTO message_reads (handle, message_id)
+      SELECT u.handle, m.id FROM users u JOIN messages m
+        ON m.created_at = u.last_message_seen_at
+       AND m.from_user != u.handle
+       AND (m.to_user = u.handle OR m.to_user IS NULL);
+    `);
+    db.prepare(`INSERT INTO settings (key, value) VALUES ('migr_p1_msg_status', datetime('now'))`).run();
+  }
+}
+
 // Normalize legacy status value 'done' → 'closed' so the new state
 // machine has a single terminal-success state.
 db.exec(`UPDATE tasks SET status = 'closed' WHERE status = 'done'`);
 
 // Active statuses = tasks that are still live (open or being worked on).
 // Used by listTasks / listTasksForUser / my_tasks.
-const ACTIVE_STATUSES = "('open', 'in_progress', 'pushed')";
+// P1 adds acked / waiting / blocked (report states) to the live set.
+const ACTIVE_STATUSES = "('open', 'acked', 'in_progress', 'pushed', 'waiting', 'blocked')";
+
+// Priority vocabulary + rank (higher = more urgent). Legacy values map onto
+// the new ones so old clients keep working.
+export const PRIORITIES = ["low", "medium", "high", "immediate"];
+export const PRIORITY_RANK = { low: 0, medium: 1, high: 2, immediate: 3 };
+export function normalizePriority(p) {
+  if (p === undefined || p === null || p === "") return "medium";
+  const v = String(p).toLowerCase();
+  if (v === "normal") return "medium";
+  if (v === "urgent") return "immediate";
+  return PRIORITIES.includes(v) ? v : null;
+}
+// SQL fragment ranking a priority column (unknown → medium).
+const PRIO_CASE = `CASE priority WHEN 'immediate' THEN 3 WHEN 'urgent' THEN 3 WHEN 'high' THEN 2
+  WHEN 'low' THEN 0 ELSE 1 END`;
+
+export const MESSAGE_TYPES = ["task", "question", "request_permission", "report", "ack", "info"];
+export const ACK_MODES = ["yes", "no", "auto"];
+export const REPORT_STATES = ["done", "continuing", "waiting", "blocked"];
+export const MESSAGE_STATUSES = ["queued", "delivered", "acked", "answered", "closed"];
+export const BODY_MAX_CHARS = parseInt(process.env.DISPATCH_BODY_MAX || "1500", 10);
 
 // Prepared statements
 const stmts = {
@@ -147,16 +246,39 @@ const stmts = {
     INSERT INTO tasks (
       id, kind, type, title, description, files,
       from_user, to_user, priority,
-      repo, base_branch, base_commit, head_branch, head_commit, pr_url
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      repo, base_branch, base_commit, head_branch, head_commit, pr_url,
+      ack_required, documents, thread_id
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `),
+  lastTaskIdForDay: db.prepare(`
+    SELECT id FROM tasks WHERE id LIKE ? ORDER BY id DESC LIMIT 1
+  `),
+  ackTask: db.prepare(`
+    UPDATE tasks
+       SET acked_at = COALESCE(acked_at, datetime('now')),
+           status = CASE WHEN status = 'open' THEN 'acked' ELSE status END,
+           claimed_by = COALESCE(claimed_by, ?),
+           updated_at = datetime('now')
+     WHERE id = ?
+  `),
+  setTaskStatus: db.prepare(`
+    UPDATE tasks
+       SET status = ?, claimed_by = COALESCE(claimed_by, ?), updated_at = datetime('now')
+     WHERE id = ?
+  `),
+  openTasksFor: db.prepare(`
+    SELECT id, kind, type, title, from_user, to_user, status, priority, ack_required,
+           acked_at, claimed_by, thread_id, created_at, updated_at
+      FROM tasks
+     WHERE (to_user = ? OR claimed_by = ?)
+       AND status IN ${ACTIVE_STATUSES}
+     ORDER BY ${PRIO_CASE} DESC, created_at ASC
   `),
   getTask: db.prepare(`SELECT * FROM tasks WHERE id = ?`),
   listTasks: db.prepare(`
     SELECT * FROM tasks
     WHERE status IN ${ACTIVE_STATUSES}
-    ORDER BY
-      CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 WHEN 'low' THEN 3 END,
-      created_at DESC
+    ORDER BY ${PRIO_CASE} DESC, created_at DESC
   `),
   listTasksForUser: db.prepare(`
     SELECT * FROM tasks
@@ -167,7 +289,7 @@ const stmts = {
   listAllTasks: db.prepare(`SELECT * FROM tasks ORDER BY created_at DESC LIMIT ?`),
   claimTask: db.prepare(`
     UPDATE tasks SET status = 'in_progress', claimed_by = ?, updated_at = datetime('now')
-    WHERE id = ? AND status = 'open'
+    WHERE id = ? AND status IN ('open', 'acked')
   `),
   pushWork: db.prepare(`
     UPDATE tasks
@@ -226,6 +348,16 @@ const stmts = {
       files = excluded.files,
       last_seen = datetime('now')
   `),
+  // Hook-reported turn state. Does not touch working_on/files.
+  upsertPresenceState: db.prepare(`
+    INSERT INTO presence (user, working_on, files, last_seen, state, state_at, session)
+    VALUES (?, NULL, '[]', datetime('now'), ?, datetime('now'), ?)
+    ON CONFLICT(user) DO UPDATE SET
+      state = excluded.state,
+      state_at = datetime('now'),
+      session = COALESCE(excluded.session, presence.session),
+      last_seen = datetime('now')
+  `),
   getPresence: db.prepare(`SELECT * FROM presence`),
   checkConflicts: db.prepare(`
     SELECT * FROM presence WHERE user != ? AND last_seen > datetime('now', '-10 minutes')
@@ -271,29 +403,49 @@ const stmts = {
   touchRepoFetched: db.prepare(`
     UPDATE repos SET last_fetched_at = datetime('now') WHERE name = ?
   `),
-  // ── Messages (lightweight inter-agent notes) ──────────────────────
+  // ── Messages (typed inter-agent notes, dispatch v2 P1) ────────────
   insertMessage: db.prepare(`
-    INSERT INTO messages (id, from_user, to_user, body, priority)
-    VALUES (?, ?, ?, ?, ?)
+    INSERT INTO messages (id, from_user, to_user, body, priority,
+                          type, ack, re, task_id, state, attachments, force)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `),
-  // Unread = addressed to me (or broadcast), authored by someone else, and
-  // newer than my read cursor. COALESCE to created_at so a freshly-added
-  // user sees messages sent after they registered, not a historical wall.
+  getMessage: db.prepare(`SELECT * FROM messages WHERE id = ?`),
+  // Unread = addressed to me (or broadcast), authored by someone else, at or
+  // after my cursor, and not in my read set. Ordered oldest-first; the
+  // optional min-priority rank filter is what makes `--priority high+` a
+  // real partial drain rather than a display trick.
   getUnreadMessages: db.prepare(`
-    SELECT * FROM messages
-     WHERE from_user != ?
-       AND (to_user = ? OR to_user IS NULL)
-       AND created_at > (
-         SELECT COALESCE(last_message_seen_at, created_at)
-           FROM users WHERE handle = ?
+    SELECT * FROM messages m
+     WHERE m.from_user != ?
+       AND (m.to_user = ? OR m.to_user IS NULL)
+       AND m.created_at >= (
+         SELECT COALESCE(last_message_seen_at, created_at) FROM users WHERE handle = ?
        )
-     ORDER BY created_at ASC
+       AND NOT EXISTS (SELECT 1 FROM message_reads r WHERE r.handle = ? AND r.message_id = m.id)
+       AND (${PRIO_CASE.replace(/priority/g, "m.priority")}) >= ?
+     ORDER BY m.created_at ASC, m.rowid ASC
   `),
-  // Advance the cursor to a specific timestamp (the newest message just
-  // drained), not datetime('now') — so a message that lands mid-drain
-  // isn't skipped.
+  markRead: db.prepare(`
+    INSERT OR IGNORE INTO message_reads (handle, message_id) VALUES (?, ?)
+  `),
+  markDelivered: db.prepare(`
+    UPDATE messages SET status = 'delivered', delivered_at = datetime('now')
+     WHERE id = ? AND status = 'queued'
+  `),
   markMessagesSeenTo: db.prepare(`
     UPDATE users SET last_message_seen_at = ? WHERE handle = ?
+  `),
+  pruneReadsBelow: db.prepare(`
+    DELETE FROM message_reads
+     WHERE handle = ?
+       AND message_id IN (SELECT id FROM messages WHERE created_at < ?)
+  `),
+  setMessageStatus: db.prepare(`
+    UPDATE messages
+       SET status = ?,
+           acked_at  = CASE WHEN ? = 'acked'  THEN datetime('now') ELSE acked_at  END,
+           closed_at = CASE WHEN ? = 'closed' THEN datetime('now') ELSE closed_at END
+     WHERE id = ?
   `),
   getRecentMessages: db.prepare(`
     SELECT * FROM messages
@@ -301,12 +453,60 @@ const stmts = {
      ORDER BY created_at DESC
      LIMIT ?
   `),
+  // History after a given message (by that message's created_at/rowid),
+  // for `dispatch-recv --since <id>`. Non-destructive.
+  historyAfter: db.prepare(`
+    SELECT m.* FROM messages m, (SELECT created_at, rowid AS r FROM messages WHERE id = ?) a
+     WHERE (m.to_user = ? OR m.from_user = ? OR m.to_user IS NULL)
+       AND (m.created_at > a.created_at OR (m.created_at = a.created_at AND m.rowid > a.r))
+     ORDER BY m.created_at ASC, m.rowid ASC
+     LIMIT ?
+  `),
+  lastReportAt: db.prepare(`
+    SELECT MAX(created_at) AS t FROM messages WHERE from_user = ? AND type = 'report'
+  `),
+  // ack-required messages delivered to me that nobody has acked yet
+  unackedRequired: db.prepare(`
+    SELECT id, from_user, type, priority, created_at, task_id, substr(body, 1, 120) AS summary
+      FROM messages
+     WHERE to_user = ?
+       AND status = 'delivered'
+       AND (ack = 'yes' OR (ack = 'auto' AND priority IN ('high', 'immediate')))
+     ORDER BY created_at ASC
+  `),
+  // Fleet overview: per-handle unread depth + oldest unread (broadcasts
+  // are counted for everyone but the sender).
+  inboxDepth: db.prepare(`
+    SELECT COUNT(*) AS n, MIN(m.created_at) AS oldest,
+           SUM(CASE WHEN m.priority IN ('high', 'immediate') THEN 1 ELSE 0 END) AS high_plus
+      FROM messages m
+     WHERE m.from_user != ?
+       AND (m.to_user = ? OR m.to_user IS NULL)
+       AND m.created_at >= (
+         SELECT COALESCE(last_message_seen_at, created_at) FROM users WHERE handle = ?
+       )
+       AND NOT EXISTS (SELECT 1 FROM message_reads r WHERE r.handle = ? AND r.message_id = m.id)
+  `),
   pruneMessages: db.prepare(`
     DELETE FROM messages WHERE created_at < ?
   `),
 };
 
+// Human-facing task id: T-YYYYMMDD-NN (date in the display zone, NN = per-day
+// sequence). Overflows to three digits past 99 rather than failing.
+export function nextTaskId(date = new Date()) {
+  const day = localDateStamp(date);
+  const last = stmts.lastTaskIdForDay.get(`T-${day}-%`);
+  let n = 1;
+  if (last) {
+    const m = /-(\d+)$/.exec(last.id);
+    if (m) n = parseInt(m[1], 10) + 1;
+  }
+  return `T-${day}-${String(n).padStart(2, "0")}`;
+}
+
 export function createTask({
+  id = null,
   kind = "discussion",
   type = "freeform",
   title,
@@ -314,17 +514,20 @@ export function createTask({
   files = [],
   from_user,
   to_user = null,
-  priority = "normal",
+  priority = "medium",
   repo = null,
   base_branch = null,
   base_commit = null,
   head_branch = null,
   head_commit = null,
   pr_url = null,
+  ack_required = 0,
+  documents = [],
+  thread_id = null,
 }) {
-  const id = randomUUID().slice(0, 8);
+  const taskId = id || randomUUID().slice(0, 8);
   stmts.createTask.run(
-    id,
+    taskId,
     kind,
     type,
     title,
@@ -332,21 +535,82 @@ export function createTask({
     JSON.stringify(files),
     from_user,
     to_user,
-    priority,
+    normalizePriority(priority) || "medium",
     repo,
     base_branch,
     base_commit,
     head_branch,
     head_commit,
-    pr_url
+    pr_url,
+    ack_required ? 1 : 0,
+    JSON.stringify(documents || []),
+    thread_id
   );
+  return getTask(taskId);
+}
+
+// Task spawned by a type=task message. Title = first line of the body
+// (trimmed to 80 chars); the message id becomes thread_id so replies with
+// --re <msg id> resolve back to the task.
+export function createTaskFromMessage(msg) {
+  const firstLine = (msg.body || "").split("\n").find((l) => l.trim()) || "(untitled)";
+  const title = firstLine.trim().length > 80 ? firstLine.trim().slice(0, 77) + "..." : firstLine.trim();
+  const ackRequired =
+    msg.ack === "yes" || (msg.ack === "auto" && (msg.priority === "high" || msg.priority === "immediate"));
+  // Retry once on a same-second id collision (two senders in the same tick).
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      return createTask({
+        id: nextTaskId(),
+        kind: "discussion",
+        type: "task",
+        title,
+        description: msg.body,
+        from_user: msg.from_user,
+        to_user: msg.to_user,
+        priority: msg.priority,
+        ack_required: ackRequired,
+        documents: Array.isArray(msg.attachments)
+          ? msg.attachments
+          : JSON.parse(msg.attachments || "[]"),
+        thread_id: msg.id,
+      });
+    } catch (e) {
+      if (e.code !== "SQLITE_CONSTRAINT_PRIMARYKEY" || attempt === 2) throw e;
+    }
+  }
+  return null;
+}
+
+export function ackTask(id, by) {
+  stmts.ackTask.run(by, id);
   return getTask(id);
+}
+
+// Report-state → task status mapping. `done` closes with the report body
+// as the result; the others are live statuses the P2 board will render.
+export function applyReportState(id, state, by, result = "") {
+  const task = stmts.getTask.get(id);
+  if (!task) return null;
+  if (state === "done") {
+    stmts.completeTask.run(result, id);
+  } else if (state === "continuing") {
+    stmts.setTaskStatus.run("in_progress", by, id);
+  } else if (state === "waiting" || state === "blocked") {
+    stmts.setTaskStatus.run(state, by, id);
+  }
+  return getTask(id);
+}
+
+export function getOpenTasksFor(handle) {
+  return stmts.openTasksFor.all(handle, handle);
 }
 
 export function getTask(id) {
   const task = stmts.getTask.get(id);
   if (task) {
     task.files = JSON.parse(task.files);
+    try { task.documents = JSON.parse(task.documents || "[]"); } catch { task.documents = []; }
     const comments = stmts.getComments.all(id);
     task.comments = comments;
   }
@@ -485,40 +749,123 @@ export function pruneTasks(cutoff) {
 }
 
 // ── Messages ───────────────────────────────────────────────────────
-// Lightweight directed (or broadcast) notes between agents, separate
-// from the task lifecycle. send → store; my_messages → drain unread.
+// Typed directed (or broadcast) notes between agents. send → store;
+// pull → drain (partial drains allowed); peek → look without consuming.
 
-export function sendMessage({ from_user, to_user = null, body, priority = "normal" }) {
+export function sendMessage({
+  from_user,
+  to_user = null,
+  body,
+  priority = "medium",
+  type = "info",
+  ack = "no",
+  re = null,
+  task_id = null,
+  state = null,
+  attachments = [],
+  force = 0,
+}) {
   const id = randomUUID().slice(0, 8);
-  stmts.insertMessage.run(id, from_user, to_user, body, priority);
-  return {
+  stmts.insertMessage.run(
     id,
     from_user,
     to_user,
     body,
-    priority,
-    created_at: new Date().toISOString().replace("T", " ").slice(0, 19),
-  };
+    normalizePriority(priority) || "medium",
+    type,
+    ack,
+    re,
+    task_id,
+    state,
+    JSON.stringify(attachments || []),
+    force ? 1 : 0
+  );
+  return getMessage(id);
 }
 
-// Return unread messages for `handle` AND advance the read cursor,
-// atomically. Cursor moves to the newest drained message's created_at, so
-// a message arriving mid-drain is caught next time (not skipped, not
-// re-shown). An empty drain leaves the cursor untouched.
-export function pullUnreadMessages(handle) {
+export function getMessage(id) {
+  const m = stmts.getMessage.get(id);
+  if (!m) return null;
+  try { m.attachments = JSON.parse(m.attachments || "[]"); } catch { m.attachments = []; }
+  return m;
+}
+
+function parseAttachments(rows) {
+  for (const m of rows) {
+    try { m.attachments = JSON.parse(m.attachments || "[]"); } catch { m.attachments = []; }
+  }
+  return rows;
+}
+
+function unreadRows(handle, minPriority = "low") {
+  const rank = PRIORITY_RANK[minPriority] ?? 0;
+  return stmts.getUnreadMessages.all(handle, handle, handle, handle, rank);
+}
+
+// Look at unread messages WITHOUT consuming them (hooks, /msg/wait).
+export function peekUnreadMessages(handle, { minPriority = "low", limit = 0 } = {}) {
+  const rows = unreadRows(handle, minPriority);
+  return parseAttachments(limit > 0 ? rows.slice(0, limit) : rows);
+}
+
+export function countUnread(handle) {
+  const rows = unreadRows(handle, "low");
+  const by = { low: 0, medium: 0, high: 0, immediate: 0 };
+  for (const r of rows) by[r.priority] = (by[r.priority] || 0) + 1;
+  return { total: rows.length, by_priority: by };
+}
+
+// Drain unread messages for `handle`, atomically. A partial drain (limit or
+// min-priority) marks only the returned rows read; the rest stay unread on
+// the server — nothing is ever silently consumed. When a drain returns the
+// whole backlog the cursor advances to the newest row and older read rows
+// are pruned so message_reads stays small. Returns { messages, remaining }.
+export function pullUnreadMessages(handle, { minPriority = "low", limit = 0 } = {}) {
   const tx = db.transaction(() => {
-    const rows = stmts.getUnreadMessages.all(handle, handle, handle);
-    if (rows.length > 0) {
-      // rows are ASC by created_at, so the last one is the newest.
-      stmts.markMessagesSeenTo.run(rows[rows.length - 1].created_at, handle);
+    const all = unreadRows(handle, minPriority);
+    const rows = limit > 0 ? all.slice(0, limit) : all;
+    for (const r of rows) {
+      stmts.markRead.run(handle, r.id);
+      if (stmts.markDelivered.run(r.id).changes > 0) {
+        r.status = "delivered";
+        r.delivered_at = utcNow();
+      }
     }
-    return rows;
+    const drainedEverything = rows.length === all.length && minPriority === "low";
+    if (drainedEverything && rows.length > 0) {
+      const newest = rows[rows.length - 1].created_at;
+      stmts.markMessagesSeenTo.run(newest, handle);
+      stmts.pruneReadsBelow.run(handle, newest);
+    }
+    const remaining = drainedEverything ? 0 : unreadRows(handle, "low").length;
+    return { messages: parseAttachments(rows), remaining };
   });
   return tx();
 }
 
+export function setMessageStatus(id, status) {
+  stmts.setMessageStatus.run(status, status, status, id);
+  return getMessage(id);
+}
+
+export function messageHistoryAfter(handle, sinceId, limit = 100) {
+  return parseAttachments(stmts.historyAfter.all(sinceId, handle, handle, limit));
+}
+
+export function lastReportAt(handle) {
+  return stmts.lastReportAt.get(handle)?.t || null;
+}
+
+export function unackedRequiredFor(handle) {
+  return stmts.unackedRequired.all(handle);
+}
+
+export function inboxDepth(handle) {
+  return stmts.inboxDepth.get(handle, handle, handle, handle);
+}
+
 export function getRecentMessages(handle, limit = 50) {
-  return stmts.getRecentMessages.all(handle, handle, limit);
+  return parseAttachments(stmts.getRecentMessages.all(handle, handle, limit));
 }
 
 export function pruneMessages(cutoff) {
@@ -533,6 +880,12 @@ export function updatePresence(user, workingOn = null, files = []) {
 
 export function getPresence() {
   return stmts.getPresence.all().map((p) => ({ ...p, files: JSON.parse(p.files) }));
+}
+
+export const PRESENCE_STATES = ["busy", "turn_end", "idle", "offline"];
+export function setPresenceState(user, state, session = null) {
+  stmts.upsertPresenceState.run(user, state, session);
+  return { user, state, session };
 }
 
 export function checkConflicts(user, files = []) {

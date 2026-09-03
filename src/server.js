@@ -26,7 +26,30 @@ import {
   markCompletionsSeen,
   sendMessage,
   pullUnreadMessages,
+  peekUnreadMessages,
+  countUnread,
+  getMessage,
+  setMessageStatus,
+  messageHistoryAfter,
+  lastReportAt,
+  unackedRequiredFor,
+  inboxDepth,
+  createTaskFromMessage,
+  ackTask,
+  applyReportState,
+  getOpenTasksFor,
+  setPresenceState,
+  normalizePriority,
+  PRIORITIES,
+  PRIORITY_RANK,
+  MESSAGE_TYPES,
+  ACK_MODES,
+  REPORT_STATES,
+  PRESENCE_STATES,
+  BODY_MAX_CHARS,
 } from "./store.js";
+import db from "./store.js";
+import { localizeMessages, toDisplayTz, utcNow } from "./tz.js";
 import {
   verifyCommitWithFetch,
   getDiffStats,
@@ -41,25 +64,6 @@ import {
 } from "./auth.js";
 
 const PORT = process.env.PORT || 7900;
-
-// ── Timezone display ───────────────────────────────────────────────
-// Timestamps are STORED as UTC (SQLite datetime('now')); admin purge +
-// the dashboard rely on that. But the agent-facing message surfaces
-// (my_messages, /msg/recv) render created_at to the fleet's wall-clock
-// timezone (Asia/Taipei, +08) with an explicit offset so no reader ever
-// mistakes a UTC string for local time again. Storage is untouched.
-const DISPLAY_TZ = process.env.DISPATCH_TZ || "Asia/Taipei";
-const DISPLAY_TZ_SUFFIX = process.env.DISPATCH_TZ_SUFFIX || "+08";
-function toDisplayTz(utcStr) {
-  if (!utcStr || typeof utcStr !== "string") return utcStr;
-  const d = new Date(utcStr.replace(" ", "T") + "Z"); // stored value is UTC
-  if (isNaN(d.getTime())) return utcStr;
-  // sv-SE locale yields an ISO-like "YYYY-MM-DD HH:MM:SS"
-  return d.toLocaleString("sv-SE", { timeZone: DISPLAY_TZ }) + DISPLAY_TZ_SUFFIX;
-}
-function localizeMessages(msgs) {
-  return msgs.map((m) => ({ ...m, created_at: toDisplayTz(m.created_at) }));
-}
 
 // ── Event bus (for /events SSE stream) ─────────────────────────────
 //
@@ -638,45 +642,20 @@ function createMcpServer(identity) {
     "Send a lightweight note to another agent (or broadcast). Unlike a task, there's no claim/complete lifecycle — the recipient just reads it via my_messages. The recipient's watcher pokes their session when idle, so they pick it up without you doing anything else. Use this for coordination pings, status reports, and hand-offs.",
     {
       to: z.string().optional().describe("Recipient handle. Omit to broadcast to everyone online."),
-      body: z.string().describe("The message text."),
-      priority: z.enum(["low", "normal", "high", "urgent"]).optional().describe("Priority hint."),
+      body: z.string().describe(`The message text (max ${BODY_MAX_CHARS} chars; put longer material in a file and list it in attachments).`),
+      priority: z.enum(["low", "medium", "high", "immediate", "normal", "urgent"]).optional().describe("low | medium (default) | high | immediate."),
+      type: z.enum(MESSAGE_TYPES).optional().describe("task | question | request_permission | report | ack | info (default)."),
+      ack: z.enum(ACK_MODES).optional().describe("yes | no (default) | auto (= required when priority is high/immediate)."),
+      re: z.string().optional().describe("Id of the message this replies to / acks."),
+      state: z.enum(REPORT_STATES).optional().describe("report only: done | continuing | waiting | blocked."),
+      attachments: z.array(z.string()).optional().describe("Absolute file paths the recipient should read."),
     },
-    async ({ to, body, priority }) => {
-      if (to && to !== "all" && !getUserByHandle(to)) {
-        return {
-          isError: true,
-          content: [{
-            type: "text",
-            text: JSON.stringify(
-              {
-                delivered: false,
-                error: `unknown recipient handle '${to}' — message NOT delivered. Known handles: ${listUsers()
-                  .map((u) => u.handle)
-                  .join(", ")}`,
-              },
-              null,
-              2
-            ),
-          }],
-        };
+    async (args) => {
+      const r = handleSend(identity, args);
+      if (r.status !== 200) {
+        return { isError: true, content: [{ type: "text", text: JSON.stringify(r.body, null, 2) }] };
       }
-      const message = sendMessage({
-        from_user: identity,
-        to_user: to || null,
-        body,
-        priority: priority || "normal",
-      });
-      emitMessageEvent(message, identity);
-      return {
-        content: [{
-          type: "text",
-          text: JSON.stringify(
-            { delivered: true, to: to || "(broadcast)", id: message.id },
-            null,
-            2
-          ),
-        }],
-      };
+      return { content: [{ type: "text", text: JSON.stringify(r.body, null, 2) }] };
     }
   );
 
@@ -686,15 +665,17 @@ function createMcpServer(identity) {
     "Drain your unread messages (directed to you or broadcast). Each message is returned once — reading it marks it delivered. Call this when your watcher pokes you, or at the start of a session.",
     {},
     async () => {
-      const messages = localizeMessages(pullUnreadMessages(identity));
+      const { messages: raw } = pullUnreadMessages(identity);
+      const messages = localizeMessages(raw);
       if (messages.length === 0) {
         return { content: [{ type: "text", text: "📭 No unread messages." }] };
       }
       const lines = [`📬 ${messages.length} unread message(s):`];
       for (const m of messages) {
-        const pri = m.priority && m.priority !== "normal" ? ` [${m.priority}]` : "";
+        const pri = m.priority && m.priority !== "medium" ? ` [${m.priority}]` : "";
+        const typ = m.type && m.type !== "info" ? ` <${m.type}>` : "";
         const scope = m.to_user ? "" : " (broadcast)";
-        lines.push(`  • from ${m.from_user}${scope}${pri} @ ${m.created_at}`);
+        lines.push(`  • ${m.id} from ${m.from_user}${scope}${typ}${pri} @ ${m.created_at}`);
         lines.push(`    ${m.body}`);
       }
       return {
@@ -860,10 +841,10 @@ app.get("/events", (req, res) => {
   });
 });
 
-// ── Plain HTTP message API (for the shell CLI) ─────────────────────
+// ── Plain HTTP message API (for the shell CLI + hooks) ─────────────
 //
-// dispatch-send / dispatch-recv talk to these. Bearer-authed, identity
-// from the token. Same store + event bus as the MCP tools, so an
+// dispatch-send / dispatch-recv / hook.sh talk to these. Bearer-authed,
+// identity from the token. Same store + event bus as the MCP tools, so an
 // already-running agent (which can't pick up a new MCP server without a
 // restart) can still send and receive via a one-line curl. Uniform
 // across Claude Code and Codex.
@@ -879,40 +860,374 @@ function httpIdentity(req, res) {
   return user.handle;
 }
 
-app.post("/msg/send", express.json(), (req, res) => {
-  const identity = httpIdentity(req, res);
-  if (!identity) return;
-  const { to, body, priority } = req.body || {};
-  if (!body || typeof body !== "string") {
-    res.status(400).json({ error: "body (string) is required" });
-    return;
+// Count user-perceived characters (code points), not UTF-16 units, so CJK
+// and emoji don't get double-counted against the body limit.
+function charCount(str) {
+  let n = 0;
+  for (const _ of str) n++;
+  return n;
+}
+
+// Normalize the `attachments` field: accept ["/abs/path", ...] or
+// [{path, size?, sha256?, name?}, ...]; reject anything else.
+function normalizeAttachments(raw) {
+  if (raw === undefined || raw === null) return [];
+  if (!Array.isArray(raw)) return null;
+  const out = [];
+  for (const a of raw) {
+    if (typeof a === "string") {
+      if (!a.trim()) return null;
+      out.push({ path: a });
+    } else if (a && typeof a === "object" && typeof a.path === "string" && a.path.trim()) {
+      const o = { path: a.path };
+      if (Number.isFinite(a.size)) o.size = a.size;
+      if (typeof a.sha256 === "string") o.sha256 = a.sha256;
+      if (typeof a.name === "string") o.name = a.name;
+      out.push(o);
+    } else {
+      return null;
+    }
+  }
+  return out;
+}
+
+// Resolve which task a report / ack refers to. Order: explicit task_id →
+// re that IS a task id → re that is a message carrying a task_id → (report
+// only) the single open task assigned to the sender, if exactly one.
+function resolveTaskFor(identity, { task_id, re, reMsg, type }) {
+  if (task_id && getTask(task_id)) return task_id;
+  if (re && getTask(re)) return re;
+  if (reMsg && reMsg.task_id && getTask(reMsg.task_id)) return reMsg.task_id;
+  if (type === "report") {
+    const open = getOpenTasksFor(identity);
+    if (open.length === 1) return open[0].id;
+  }
+  return null;
+}
+
+// Shared by POST /msg/send and the MCP send_message tool.
+// Returns { status, body } — 200 on success, 4xx with { error } otherwise.
+function handleSend(identity, payload) {
+  const p = payload || {};
+  const bad = (status, error, extra = {}) => ({ status, body: { delivered: false, error, ...extra } });
+
+  const to = p.to && p.to !== "all" ? String(p.to) : null;
+  const body = p.body;
+  if (!body || typeof body !== "string") return bad(400, "body (string) is required");
+  const nChars = charCount(body);
+  if (nChars > BODY_MAX_CHARS) {
+    return bad(
+      400,
+      `body too long: ${nChars} chars > ${BODY_MAX_CHARS}. Put the detail in a file and pass --attach <path> (body = summary + pointer).`,
+      { limit: BODY_MAX_CHARS, chars: nChars }
+    );
   }
   // Reject directed messages to unknown handles — otherwise the message is
   // silently stored under a recipient nobody polls and is never delivered.
-  if (to && to !== "all" && !getUserByHandle(to)) {
-    res.status(404).json({
-      delivered: false,
-      error: `unknown recipient handle '${to}' — message NOT delivered. Known handles: ${listUsers()
+  if (to && !getUserByHandle(to)) {
+    return bad(
+      404,
+      `unknown recipient handle '${to}' — message NOT delivered. Known handles: ${listUsers()
         .map((u) => u.handle)
-        .join(", ")}`,
-    });
-    return;
+        .join(", ")}`
+    );
   }
+  const priority = normalizePriority(p.priority);
+  if (!priority) return bad(400, `priority must be one of ${PRIORITIES.join("|")} (got '${p.priority}')`);
+  const type = p.type ? String(p.type) : "info";
+  if (!MESSAGE_TYPES.includes(type)) return bad(400, `type must be one of ${MESSAGE_TYPES.join("|")} (got '${type}')`);
+  const ack = p.ack ? String(p.ack) : "no";
+  if (!ACK_MODES.includes(ack)) return bad(400, `ack must be one of ${ACK_MODES.join("|")} (got '${ack}')`);
+  let state = p.state ? String(p.state) : null;
+  if (state && type !== "report") return bad(400, "state is only valid with type=report");
+  if (state && !REPORT_STATES.includes(state)) return bad(400, `state must be one of ${REPORT_STATES.join("|")} (got '${state}')`);
+  if (type === "report" && !state) state = "continuing";
+  const attachments = normalizeAttachments(p.attachments);
+  if (attachments === null) return bad(400, "attachments must be an array of paths or {path,size,sha256} objects");
+  const force = p.force === true || p.force === 1 || p.force === "1" ? 1 : 0;
+  if (force && priority !== "immediate") return bad(400, "--force requires --priority immediate");
+
+  const re = p.re ? String(p.re) : null;
+  let reMsg = null;
+  if (re) {
+    reMsg = getMessage(re);
+    if (!reMsg && !getTask(re)) return bad(404, `re='${re}' matches neither a message id nor a task id`);
+    if (reMsg && type === "ack" && reMsg.type === "report") {
+      return bad(400, `message ${re} is a report — reports are never acked (the protocol forbids it)`);
+    }
+    if (reMsg && type === "ack" && reMsg.type === "ack") {
+      return bad(400, `message ${re} is itself an ack — don't ack an ack`);
+    }
+  }
+  if (type === "ack" && !re) return bad(400, "type=ack requires --re <message id>");
+
+  const taskId = type === "task" ? null : resolveTaskFor(identity, { task_id: p.task_id, re, reMsg, type });
+
   const message = sendMessage({
     from_user: identity,
-    to_user: to || null,
+    to_user: to,
     body,
-    priority: priority || "normal",
+    priority,
+    type,
+    ack,
+    re,
+    task_id: taskId,
+    state,
+    attachments,
+    force,
   });
+
+  const effects = {};
+  // type=task → a task row, linked both ways.
+  if (type === "task") {
+    const task = createTaskFromMessage(message);
+    if (task) {
+      db.prepare(`UPDATE messages SET task_id = ? WHERE id = ?`).run(task.id, message.id);
+      message.task_id = task.id;
+      effects.task = { id: task.id, ack_required: !!task.ack_required, status: task.status };
+      emitTaskEvent("task_created", task, identity);
+    }
+  }
+  // type=ack re=<msg> → that message (and its task) is acknowledged.
+  if (type === "ack" && reMsg) {
+    setMessageStatus(reMsg.id, "acked");
+    if (reMsg.task_id) {
+      const t = ackTask(reMsg.task_id, identity);
+      if (t) effects.task = { id: t.id, status: t.status, acked_at: t.acked_at };
+    }
+    effects.acked = reMsg.id;
+  }
+  // type=report → task state follows `state`; a referenced message closes /
+  // gets answered.
+  if (type === "report") {
+    if (taskId) {
+      const t = applyReportState(taskId, state, identity, state === "done" ? body : "");
+      if (t) {
+        effects.task = { id: t.id, status: t.status };
+        if (state === "done") emitTaskEvent("task_completed", t, identity);
+      }
+    }
+    if (reMsg) setMessageStatus(reMsg.id, state === "done" ? "closed" : "answered");
+  }
+  // Any non-ack reply to a question / permission request answers it.
+  if (reMsg && type !== "ack" && type !== "report" &&
+      (reMsg.type === "question" || reMsg.type === "request_permission")) {
+    setMessageStatus(reMsg.id, "answered");
+    effects.answered = reMsg.id;
+  }
+
   emitMessageEvent(message, identity);
-  res.json({ delivered: true, id: message.id, to: to || "(broadcast)" });
+  return {
+    status: 200,
+    body: {
+      delivered: true,
+      id: message.id,
+      to: to || "(broadcast)",
+      type,
+      priority,
+      ack_required: ack === "yes" || (ack === "auto" && (priority === "high" || priority === "immediate")),
+      ...(message.task_id ? { task_id: message.task_id } : {}),
+      ...effects,
+    },
+  };
+}
+
+app.post("/msg/send", express.json({ limit: "256kb" }), (req, res) => {
+  const identity = httpIdentity(req, res);
+  if (!identity) return;
+  const r = handleSend(identity, req.body);
+  res.status(r.status).json(r.body);
 });
 
+// Parse "high", "high+", "medium+" → a minimum priority (the "+" is implied:
+// a filter always means "this level and above").
+function parseMinPriority(q) {
+  if (!q) return "low";
+  const v = normalizePriority(String(q).replace(/\+$/, ""));
+  return v || null;
+}
+
+// Drain (default) or peek (?peek=1). ?limit=N bounds the drain — the rest
+// STAYS UNREAD on the server (see store.pullUnreadMessages). ?priority=high+
+// drains only that level and above.
 app.get("/msg/recv", (req, res) => {
   const identity = httpIdentity(req, res);
   if (!identity) return;
-  const messages = localizeMessages(pullUnreadMessages(identity));
-  res.json({ handle: identity, count: messages.length, messages });
+  const minPriority = parseMinPriority(req.query.priority);
+  if (!minPriority) return res.status(400).json({ error: `bad priority filter '${req.query.priority}'` });
+  const limit = Math.max(0, parseInt(req.query.limit || "0", 10) || 0);
+  const peek = req.query.peek === "1" || req.query.peek === "true";
+  let messages, remaining;
+  if (peek) {
+    messages = peekUnreadMessages(identity, { minPriority, limit });
+    remaining = countUnread(identity).total - messages.length;
+  } else {
+    ({ messages, remaining } = pullUnreadMessages(identity, { minPriority, limit }));
+  }
+  res.json({
+    handle: identity,
+    count: messages.length,
+    remaining,
+    remaining_by_priority: remaining > 0 ? countUnread(identity).by_priority : undefined,
+    messages: localizeMessages(messages),
+  });
+});
+
+// Non-destructive history: everything involving me after message <since>.
+app.get("/msg/history", (req, res) => {
+  const identity = httpIdentity(req, res);
+  if (!identity) return;
+  const since = req.query.since ? String(req.query.since) : null;
+  const limit = Math.min(500, Math.max(1, parseInt(req.query.limit || "100", 10) || 100));
+  if (!since) return res.status(400).json({ error: "since=<message id> is required" });
+  if (!getMessage(since)) return res.status(404).json({ error: `message ${since} not found` });
+  const messages = messageHistoryAfter(identity, since, limit);
+  res.json({ handle: identity, count: messages.length, messages: localizeMessages(messages) });
+});
+
+// Long-poll: block until an unread message at/above ?priority arrives (or
+// ?timeout seconds elapse). Peek semantics — never consumes. Used by the
+// B′ asyncRewake experiment. Capped below Node's 300s request timeout.
+const WAIT_MAX_S = parseInt(process.env.DISPATCH_WAIT_MAX_S || "280", 10);
+app.get("/msg/wait", (req, res) => {
+  const identity = httpIdentity(req, res);
+  if (!identity) return;
+  const minPriority = parseMinPriority(req.query.priority);
+  if (!minPriority) return res.status(400).json({ error: `bad priority filter '${req.query.priority}'` });
+  const timeoutS = Math.min(WAIT_MAX_S, Math.max(1, parseInt(req.query.timeout || "60", 10) || 60));
+  const minRank = PRIORITY_RANK[minPriority];
+
+  const check = () => peekUnreadMessages(identity, { minPriority });
+  let done = false;
+  const finish = (messages, timedOut) => {
+    if (done) return;
+    done = true;
+    clearTimeout(timer);
+    dispatchEvents.off("task", handler);
+    res.json({
+      handle: identity,
+      timed_out: timedOut,
+      count: messages.length,
+      messages: localizeMessages(messages),
+    });
+  };
+  const handler = (event) => {
+    if (event.type !== "message_created" || !event.message) return;
+    const m = event.message;
+    if (m.from_user === identity) return;
+    if (m.to_user && m.to_user !== identity) return;
+    if ((PRIORITY_RANK[m.priority] ?? 1) < minRank) return;
+    const found = check();
+    if (found.length > 0) finish(found, false);
+  };
+  const timer = setTimeout(() => finish(check(), true), timeoutS * 1000);
+  const first = check();
+  if (first.length > 0) return finish(first, false);
+  dispatchEvents.on("task", handler);
+  req.on("close", () => {
+    if (done) return;
+    done = true;
+    clearTimeout(timer);
+    dispatchEvents.off("task", handler);
+  });
+});
+
+// Hook digest: everything ~/.dispatch/hook.sh needs in ONE cheap call.
+// Never consumes anything. `since` (optional, UTC "YYYY-MM-DD HH:MM:SS")
+// lets the Stop hook ask "did I report since my turn started?".
+app.get("/hook/digest", (req, res) => {
+  const identity = httpIdentity(req, res);
+  if (!identity) return;
+  const unread = peekUnreadMessages(identity, {});
+  const by = { low: 0, medium: 0, high: 0, immediate: 0 };
+  for (const m of unread) by[m.priority] = (by[m.priority] || 0) + 1;
+  const summarize = (m) => ({
+    id: m.id,
+    from_user: m.from_user,
+    to_user: m.to_user,
+    type: m.type,
+    priority: m.priority,
+    ack: m.ack,
+    force: !!m.force,
+    task_id: m.task_id,
+    re: m.re,
+    created_at: toDisplayTz(m.created_at),
+    summary: m.body.length > 120 ? m.body.slice(0, 117).replace(/\s+/g, " ") + "..." : m.body.replace(/\s+/g, " "),
+    chars: charCount(m.body),
+    attachments: m.attachments.length,
+  });
+  const openTasks = getOpenTasksFor(identity).map((t) => ({
+    ...t,
+    created_at: toDisplayTz(t.created_at),
+    updated_at: toDisplayTz(t.updated_at),
+  }));
+  const reportAt = lastReportAt(identity);
+  res.json({
+    handle: identity,
+    server_time: utcNow(),
+    unread: { total: unread.length, by_priority: by, items: unread.map(summarize) },
+    immediate: localizeMessages(unread.filter((m) => m.priority === "immediate")),
+    open_tasks: openTasks,
+    unacked_required: unackedRequiredFor(identity).map((m) => ({ ...m, created_at: toDisplayTz(m.created_at) })),
+    last_report_at: reportAt,
+    reported_since: req.query.since ? !!(reportAt && reportAt >= String(req.query.since)) : undefined,
+  });
+});
+
+// Hook-reported turn state: busy (UserPromptSubmit) / turn_end (Stop) /
+// idle (Notification idle_prompt) / offline (SessionEnd).
+app.post("/presence", express.json(), (req, res) => {
+  const identity = httpIdentity(req, res);
+  if (!identity) return;
+  const state = req.body && String(req.body.state || "");
+  if (!PRESENCE_STATES.includes(state)) {
+    return res.status(400).json({ error: `state must be one of ${PRESENCE_STATES.join("|")}` });
+  }
+  const session = req.body.session ? String(req.body.session).slice(0, 120) : null;
+  res.json(setPresenceState(identity, state, session));
+});
+
+// Fleet overview for `dispatch-fleet check` and the P2 dashboard: per
+// handle, last contact, hook-reported state, inbox depth, open tasks.
+app.get("/fleet", (req, res) => {
+  const identity = httpIdentity(req, res);
+  if (!identity) return;
+  const presence = new Map(getPresence().map((p) => [p.user, p]));
+  const live = new Set(getLivePresence().map((p) => p.user));
+  const rows = listUsers().map((u) => {
+    const p = presence.get(u.handle);
+    const depth = inboxDepth(u.handle);
+    const open = getOpenTasksFor(u.handle);
+    return {
+      handle: u.handle,
+      last_seen_at: toDisplayTz(u.last_seen_at),
+      mcp_connected: live.has(u.handle),
+      state: p?.state || null,
+      state_at: toDisplayTz(p?.state_at || null),
+      session: p?.session || null,
+      unread: depth.n || 0,
+      unread_high_plus: depth.high_plus || 0,
+      oldest_unread_at: toDisplayTz(depth.oldest),
+      open_tasks: open.length,
+      unacked_tasks: open.filter((t) => t.ack_required && !t.acked_at).length,
+    };
+  });
+  res.json({ requested_by: identity, server_time: toDisplayTz(utcNow()), handles: rows });
+});
+
+// One message, full text. Only parties to it (sender, recipient, or anyone
+// for a broadcast) may read it.
+app.get("/msg/:id", (req, res) => {
+  const identity = httpIdentity(req, res);
+  if (!identity) return;
+  const m = getMessage(req.params.id);
+  if (!m) return res.status(404).json({ error: `message ${req.params.id} not found` });
+  if (m.to_user && m.to_user !== identity && m.from_user !== identity) {
+    return res.status(403).json({ error: "not a party to this message" });
+  }
+  const out = localizeMessages([m])[0];
+  if (m.task_id) out.task = getTask(m.task_id) || null;
+  res.json(out);
 });
 
 // ── Dashboard auth (JWT cookie) ────────────────────────────────────

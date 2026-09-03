@@ -14,6 +14,11 @@ Behaviour per event (spec: DISPATCH-V2-SPEC.md §P1.4):
                     stop_hook_active=true → always allow
   Notification      idle_prompt → presence=idle
   SessionEnd        presence=offline
+  Wait              (B′ experiment; run as an async Stop hook with asyncRewake)
+                    long-poll /msg/wait?priority=medium+ until a message lands →
+                    print the digest and exit 2 so Claude Code re-wakes the
+                    session; exit 0 quietly at the deadline (DISPATCH_WAIT_TOTAL_S,
+                    default 600). One waiter per session (pid file).
 
 Every server call has a ≤2s timeout; if the server is down we exit 0 silently.
 """
@@ -227,7 +232,12 @@ def main():
         if reason:
             st["blocked_turn"] = turn_start
             save_state(handle, session_id, st)
+            # Documented block signal for Stop: exit 2, stderr = reason. The JSON
+            # form on stdout is kept for older builds that parse it.
             out({"decision": "block", "reason": reason})
+            sys.stderr.write(reason + "\n")
+            sys.stderr.flush()
+            sys.exit(2)
         return
 
     if event == "Notification":
@@ -239,7 +249,71 @@ def main():
 
     if event == "SessionEnd":
         presence(tok, "offline", session_name)
+        _kill_waiter(handle, session_id)
         return
+
+    if event == "Wait":
+        wait_loop(tok, handle, session_id)
+        return
+
+
+def _waiter_pid_path(handle, session_id):
+    return os.path.join(STATE_DIR, "%s-%s.wait.pid" % (handle, (session_id or "nosession")[:36]))
+
+
+def _kill_waiter(handle, session_id):
+    try:
+        with open(_waiter_pid_path(handle, session_id)) as f:
+            pid = int(f.read().strip() or 0)
+        if pid and pid != os.getpid():
+            os.kill(pid, 15)
+    except (OSError, ValueError):
+        pass
+
+
+def wait_loop(tok, handle, session_id):
+    """B′: block until a medium+ message is unread, then exit 2 with the digest."""
+    total = float(os.environ.get("DISPATCH_WAIT_TOTAL_S", "600"))
+    min_pri = os.environ.get("DISPATCH_WAIT_PRIORITY", "medium")
+    log = os.path.join(STATE_DIR, "wait.log")
+    _kill_waiter(handle, session_id)
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(_waiter_pid_path(handle, session_id), "w") as f:
+            f.write(str(os.getpid()))
+    except OSError:
+        pass
+
+    def logln(msg):
+        try:
+            with open(log, "a") as f:
+                f.write("%s %s %s pid=%d %s\n" % (time.strftime("%H:%M:%S"), handle, (session_id or "-")[:8], os.getpid(), msg))
+        except OSError:
+            pass
+    logln("wait start total=%ss min=%s" % (total, min_pri))
+    deadline = time.time() + total
+    while time.time() < deadline:
+        chunk = int(min(280, max(1, deadline - time.time())))
+        try:
+            st, d = D.http("GET", "/msg/wait?priority=%s%%2B&timeout=%d" % (min_pri, chunk), token=tok, timeout=chunk + 5)
+        except D.DispatchError as e:
+            logln("server error: %s — sleeping 10s" % e)
+            time.sleep(10)
+            continue
+        if st != 200 or not d:
+            logln("bad response %s" % st)
+            time.sleep(5)
+            continue
+        if d.get("count"):
+            dg = digest(tok) or {"unread": {"total": d["count"], "by_priority": {}, "items": []}, "open_tasks": []}
+            text = digest_text(dg, handle, header="[dispatch wake]") or "[dispatch wake] %d new message(s) — run %s" % (d["count"], RECV_HINT)
+            logln("message arrived (%d) -> exit 2" % d["count"])
+            sys.stdout.write(text + "\n")
+            sys.stderr.write(text + "\n")
+            sys.stdout.flush()
+            sys.stderr.flush()
+            sys.exit(2)
+    logln("deadline reached -> exit 0")
 
 
 if __name__ == "__main__":

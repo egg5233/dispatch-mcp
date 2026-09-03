@@ -94,13 +94,13 @@
 
 ## 閒置喚醒路徑（B′ 實測結果，2026-09-03 17:07）
 
-**可用，成為主路徑。** `asyncRewake: true` 的 Stop hook 會在背景跑 `hook.sh Wait`（長輪詢 `/msg/wait?priority=medium+`）；有 medium+ 訊息時它 exit 2，Claude Code 在 3 秒內把 session 叫醒（畫面出現「Stop hook feedback」，系統提醒內容 = digest），agent 自己跑 `dispatch-recv` 處理。實測：17:07:35 送出 → 17:07:38 agent 回覆。`low` 不會觸發（waiter 只看 medium+）。每次 Stop 會重新起一個 waiter（舊的由 pid 檔殺掉）；waiter 壽命 = `DISPATCH_WAIT_TOTAL_S`（預設 600 秒）到期後 exit 0 靜默結束，之後只剩 watcher 鍵盤路徑與下一回合 digest。
+**可用，成為主路徑。** `asyncRewake: true` 的 Stop hook 會在背景跑 `hook.sh Wait`（長輪詢 `/msg/wait?priority=medium+`）；有 medium+ 訊息時它 exit 2，Claude Code 在 3 秒內把 session 叫醒（畫面出現「Stop hook feedback」，系統提醒內容 = digest），agent 自己跑 `dispatch-recv` 處理。實測：17:07:35 送出 → 17:07:38 agent 回覆。`low` 不會觸發（waiter 只看 medium+）。每次 Stop 會重新起一個 waiter（舊的由 pid 檔殺掉）；waiter 壽命 = min(`DISPATCH_WAIT_TOTAL_S`, hook 的 `timeout`)：**Claude Code 會在 hook `timeout` 到時殺掉 async waiter 且不喚醒**（實測 timeout 900 → 15 分鐘後 waiter 消失、之後的 high 訊息沒人接）。所以設定用 timeout 86400 + DISPATCH_WAIT_TOTAL_S=86000（一天）；到期靜默結束後只剩 watcher 鍵盤路徑與下一回合 digest。
 
 啟用（加進上面 Stop 那組，與同步 Stop hook 並列）：
 ```json
 "Stop":[{"hooks":[
   {"type":"command","command":"$HOME/.dispatch/hook.sh Stop","timeout":10},
-  {"type":"command","command":"$HOME/.dispatch/hook.sh Wait","timeout":900,"async":true,"asyncRewake":true}
+  {"type":"command","command":"DISPATCH_WAIT_TOTAL_S=86000 $HOME/.dispatch/hook.sh Wait","timeout":86400,"async":true,"asyncRewake":true}
 ]}]
 ```
 備援：對閒置的 Claude handle，`dispatch-send` 會印 `hint: <handle> is idle (Claude session "<name>") — SendMessage(to="<name>")`，coord 可用原生 SendMessage 立即叫醒；Codex handle 維持 P0 的守衛式鍵盤 watcher（Codex 0.148 hooks 沒有 Stop 事件，見 README）。

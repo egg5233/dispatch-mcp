@@ -23,8 +23,10 @@ BLOCK = {
     "PreToolUse":       [{"hooks": [{"type": "command", "command": H + " PreToolUse", "timeout": 10}]}],
     "PostToolUse":      [{"hooks": [{"type": "command", "command": H + " PostToolUse", "timeout": 10}]}],
     "Stop":             [{"hooks": [{"type": "command", "command": H + " Stop", "timeout": 10},
-                                    {"type": "command", "command": H + " Wait", "timeout": 900,
-                                     "async": True, "asyncRewake": True}]}],
+                                    # asyncRewake waiters are killed at `timeout` (measured: a 900 s
+                                    # timeout killed the waiter at 15 min with no rewake). One day.
+                                    {"type": "command", "command": "DISPATCH_WAIT_TOTAL_S=86000 " + H + " Wait",
+                                     "timeout": 86400, "async": True, "asyncRewake": True}]}],
     "Notification":     [{"matcher": "idle_prompt",
                           "hooks": [{"type": "command", "command": H + " Notification", "timeout": 10}]}],
     "SessionEnd":       [{"hooks": [{"type": "command", "command": H + " SessionEnd", "timeout": 10}]}],

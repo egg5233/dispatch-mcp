@@ -215,6 +215,9 @@ def cmd_watchers(restart, only):
         if not ent.get("pane") or not ent.get("token"):
             print("skip %s: no pane/token" % h)
             continue
+        if ent.get("no_watcher"):
+            print("skip %s: no_watcher (hooks-only handle)" % h)
+            continue
         name = "watch-" + h
         env = dict(os.environ)
         env.update({
@@ -305,6 +308,8 @@ def cmd_check(as_json=False):
             verdict.append("WATCHER PANE %s≠%s" % (wpane, pane))
         if w and wstat != "online":
             verdict.append("watcher %s" % wstat)
+        if ent.get("no_watcher"):
+            wstat = "hooks-only"
         if runtime == "claude" and p and match and not s:
             verdict.append("no Claude session record")
         if verdict:

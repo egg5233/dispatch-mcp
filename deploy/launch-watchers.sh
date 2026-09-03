@@ -12,7 +12,7 @@ for row in "${ROWS[@]}"; do
   read -r pane handle token <<<"$row"
   [ -n "$ONLY" ] && [ "$handle" != "$ONLY" ] && continue
   DISPATCH_URL="$BASE/events" DISPATCH_TOKEN="$token" TMUX_TARGET="$pane" TMUX_TMPDIR="$TTD" \
-    DISPATCH_PROMPT="$PROMPT" DISPATCH_IDLE_POLL_MS=1500 \
+    DISPATCH_PROMPT="$PROMPT" DISPATCH_IDLE_POLL_MS=1500 DISPATCH_MIN_WAKE_PRIORITY="${DISPATCH_MIN_WAKE_PRIORITY:-medium}" \
     pm2 start "$WATCHER" --name "watch-$handle" --interpreter node --update-env -f >/dev/null 2>&1 \
     && echo "started watch-$handle ($pane)"
 done

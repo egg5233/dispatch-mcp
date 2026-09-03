@@ -49,6 +49,8 @@ for (const [pane, handle, runtime] of table) {
       TMUX_TMPDIR: TMUX_TMPDIR[HOST],
       DISPATCH_PROMPT: PROMPT,
       DISPATCH_IDLE_POLL_MS: "1500",
+      // dispatch v2 P1: low never keystroke-wakes; hooks surface it next turn.
+      DISPATCH_MIN_WAKE_PRIORITY: "medium",
     },
     autorestart: true,
     max_restarts: 50,
@@ -58,7 +60,16 @@ for (const [pane, handle, runtime] of table) {
 const cfg = join(homedir(), ".dispatch");
 mkdirSync(cfg, { recursive: true });
 writeFileSync(join(cfg, "registry.json"), JSON.stringify(registry, null, 2));
+// fleet.json (P1): handle-keyed single source of truth. registry.json above is
+// the pane-keyed compatibility view; `dispatch-fleet sync --write` regenerates
+// it from fleet.json later on.
+const fleet = { version: 1, generated_at: new Date().toISOString(), url: URL[HOST], tmux_tmpdir: TMUX_TMPDIR[HOST], handles: {} };
+for (const [pane, handle, runtime] of table) {
+  fleet.handles[handle] = { token: registry[pane].token, runtime, pane, watcher: `watch-${handle}` };
+}
+writeFileSync(join(cfg, "fleet.json"), JSON.stringify(fleet, null, 2) + "\n");
 writeFileSync(join(cfg, `watchers.${HOST}.cjs`), "module.exports = " + JSON.stringify({ apps }, null, 2) + ";\n");
 console.log(`registry: ${Object.keys(registry).length} panes -> ${join(cfg,"registry.json")}`);
 console.log(`ecosystem: ${join(cfg, `watchers.${HOST}.cjs`)}`);
+console.log(`fleet:     ${join(cfg, "fleet.json")}`);
 for (const [p,h] of table.map(t=>[t[0],t[1]])) console.log(`  ${p}  ${h}`);

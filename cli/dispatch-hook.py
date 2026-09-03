@@ -146,7 +146,10 @@ def main():
         inp = {}
     if not isinstance(inp, dict):
         inp = {}
-    event = inp.get("hook_event_name") or event
+    # argv wins: an async "Wait" hook is configured under the Stop event, so
+    # its stdin says hook_event_name=Stop. Only fall back to the JSON field
+    # when no argument was given.
+    event = event or inp.get("hook_event_name") or ""
     handle, tok = D.identity()
     if not tok:
         return  # not a fleet pane — stay silent

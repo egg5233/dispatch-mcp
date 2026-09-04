@@ -1,6 +1,6 @@
 # Fleet dispatch — agent protocol (v2, 2026-09-03)
 
-跨 agent 訊息匯流排。伺服器 `:7900`（pm2 `dispatch`），CLI 在 `~/.dispatch/`。身分 = 你的 tmux pane（自動，`$TMUX_PANE` → `fleet.json`）。每個 handle 屬於一個 **專案**（fleet.json `projects`）；`dispatch-send coord` 的 `coord` 由伺服器解析成**你所屬專案的 coordinator**（Pearl 的 coordinator 就是 handle `coord`，不變）。
+跨 agent 訊息匯流排。伺服器 `:7900`（pm2 `dispatch`），CLI 在 `~/.dispatch/`。身分 = 你的 tmux pane（自動，`$TMUX_PANE` → `fleet.json`）。每個 handle 屬於一個 **專案**（fleet.json `projects`）；`dispatch-send coord` 的 `coord` 由伺服器解析成**你所屬專案的 coordinator**（coordinator 本身就叫 `coord` 的專案不受影響）。
 **規則來源**：`coordination/DISPATCH-V2-SPEC.md`（使用者拍板）；本檔是給 agent 的操作手冊。
 
 ## 收訊
@@ -31,7 +31,7 @@
   --task <T-id>                  明確指定任務
   --state done|continuing|waiting|blocked   (只給 --type report)
   --project <name>               type=task：改歸到別的專案（預設 = 發送者的專案 → 該專案的 coordination/tasks/ 鏡像）
-  --attach <path> ...            附檔（本機絕對路徑，可多個；不是上傳，i5 上的 agent 讀不到）
+  --attach <path> ...            附檔（本機絕對路徑，可多個；不是上傳，其他主機上的 agent 讀不到）
   --force                        只能配 --priority immediate（見下）
 ```
 
@@ -111,136 +111,14 @@
 
 ## Fleet 與專案
 
-`~/.dispatch/fleet.json` 是本機名冊（`projects.<name>` → coordination_dir/tmux_session/coordinator；`handles.<h>` → token/runtime/pane/project/session_name），伺服器 DB 存同一份（遠端 i5 的 handle 以伺服器為準）。`~/.dispatch/dispatch-fleet check` 印健康表（project、pane 前景程式是否等於 runtime、watcher 狀態、Claude session 名稱/閒忙、伺服器端未讀深度與 open tasks，加上每個專案 fleet.json＝伺服器、coordinator 有帳號），`dispatch-fleet sync [--write]` 重建（projects 與 project 欄位保留）。
+`~/.dispatch/fleet.json` 是本機名冊（`projects.<name>` → coordination_dir/tmux_session/coordinator；`handles.<h>` → token/runtime/pane/project/session_name），伺服器 DB 存同一份（遠端主機的 handle 以伺服器為準）。`~/.dispatch/dispatch-fleet check` 印健康表（project、pane 前景程式是否等於 runtime、watcher 狀態、Claude session 名稱/閒忙、伺服器端未讀深度與 open tasks，加上每個專案 fleet.json＝伺服器、coordinator 有帳號），`dispatch-fleet sync [--write]` 重建（projects 與 project 欄位保留）。
 
-專案規則：handle 全域唯一、只屬一個專案；`type=task` 歸發送者的專案，鏡像寫到該專案的 `coordination/tasks/`（Pearl 路徑與格式不變）；`dispatch-dev` 屬平台專案 `dispatch`（coordinator 仍是 Pearl 的 `coord`，任何 coordinator 都可直接發給它）。新專案：`dispatch-fleet project add <name> --dir … --session … --coordinator coord-<name>` → `dispatch-fleet add coord-<name> --project <name> --cwd … --runtime claude` → `dispatch-fleet add <name>-<role> …`（可 `--pane %N` 登記既有 pane）→ `dispatch-fleet check`。退場：每個 handle `dispatch-fleet remove <h> --watcher`，再 `dispatch-fleet project remove <name>`。Dashboard 右上角可切換專案。
+專案規則：handle 全域唯一、只屬一個專案；`type=task` 歸發送者的專案，鏡像寫到該專案的 `coordination/tasks/`；平台型 handle（例如維護 dispatch 本身的 agent）可以放在自己的專案、由某個既有 coordinator 兼管，任何 coordinator 都可直接發給它。新專案：`dispatch-fleet project add <name> --dir … --session … --coordinator coord-<name>` → `dispatch-fleet add coord-<name> --project <name> --cwd … --runtime claude` → `dispatch-fleet add <name>-<role> …`（可 `--pane %N` 登記既有 pane）→ `dispatch-fleet check`。退場：每個 handle `dispatch-fleet remove <h> --watcher`，再 `dispatch-fleet project remove <name>`。Dashboard 右上角可切換專案。
 
-| handle | project | runtime | pane |
-|---|---|---|---|
-| coord | pearl | claude | %0 |
-| dispatch-dev | dispatch | claude | %16 |
-| docs-migrate | pearl | claude | %17 |
-| kernel-2 | pearl | claude | %3 |
-| kernel-codex | pearl | codex | %5 |
-| kernel-h100 | pearl | claude | %2 |
-| pearl-infra | pearl | claude | %4 |
-| pearl-review | pearl | codex | %6 |
-| pearl-server | pearl | claude | %9 |
-| pearl-dashboard / pearl-kernel-50 / pearl-miner (i5) | pearl | claude | remote |
+本機 handle 清單看 `~/.dispatch/dispatch-fleet check`（每列有 project / pane / runtime / watcher / 未讀）。
 
 tmux-bridge / to-fleet remain as fallback.
 
-## ★★ REPORT-TO-COORD-ON-IDLE — dispatch protocol (user standing rule, 2026-06-23)
+## 本機附加規則
 
-NEVER end a turn or go idle silently while you hold an active assignment. As your LAST action
-before stopping, ALWAYS run `~/.dispatch/dispatch-send coord "<status>"` reporting what you just
-did + current state, tagged with EXACTLY ONE of:
-- [BLOCKED] — you need coord to decide/unblock before continuing (coord will re-poke you to proceed).
-- [CONTINUING] — the turn ended but the assignment is NOT done; you intend to keep going. Use this
-  INSTEAD of silently stopping mid-task, so coord's mailbox loop re-pokes you to resume next cycle.
-- [DONE] — assignment complete, no action needed.
-- [WAITING: <what>, ETA <when>] — blocked on an external dependency (build/test/GPU/pool/user).
-
-WHY: coord's mailbox loop is the orchestrator. A silent idle = the work stalls until a human notices.
-A status ping on EVERY idle lets coord pick you up within one cycle and keep you moving. A
-[CONTINUING] or [BLOCKED] ping is NEVER noise here — report even small updates.
-
-## ★★ GIT HANDOFF DISCIPLINE (user standing rule, 2026-06-24)
-
-Recurring failure that has BLOCKED work + caused confusion (host-wiring b4999d9 was committed i5-local
-and never pushed → pearl-review couldn't fetch it; the shape-override change sat as a loose nano2 .diff
-and never hit a branch). Fix — these are MANDATORY for every agent:
-
-1. **"Done" for any handoff = PUSHED TO ORIGIN.** Before you report a branch/sha to coord or another
-   agent as ready (for review / merge / test / handoff), it MUST be on `origin`. A box-local commit is
-   NOT a deliverable.
-2. **Report the remote ref + verify it.** Report as `origin/<branch> @ <sha>` and confirm with
-   `git ls-remote origin <branch>` (paste/observe the sha). "Committed" alone is BANNED — say WHERE it
-   lives. Repos push over SSH (`git@github.com:egg5233/...`); you already have push access, so push.
-3. **Push at EVERY boundary.** Any cross-agent transition (dev→review, kernel→miner, producer→coord)
-   → commit + push FIRST. Never "I committed on my box, you pull from it."
-4. **No loose diffs/patches as the source of truth.** Don't park work as a `.diff`/`.patch` on a box
-   (e.g. `nano2:/root/*.diff`). Put it on a pushed branch. A diff file is OK only as transient
-   transport; the canonical artifact is the `origin` branch.
-5. **Unpushed WIP MUST be labeled.** If you report progress that is NOT yet pushed, tag it explicitly
-   `WIP local-only, not pushed` so no one treats it as fetchable.
-
-coord-side gate: before dispatching a downstream agent against a reported sha, coord runs
-`git ls-remote origin <branch>` to confirm it's on origin; if not, it bounces back to the producer
-("push first") instead of dispatching downstream.
-
-WHY: a sha that isn't on origin is invisible to every other agent + host. Reporting one as "ready"
-stalls the whole pipeline at the next fetch. Pushing at the boundary is ~2s and removes an entire
-class of BLOCKs.
-
-## ★★ WINRATE GATE = DEFAULT PERF METRIC (user standing rule, 2026-07-15 — SUPERSEDES pool-credited-only)
-
-For any perf A/B (kernel / variant / shape / dispatch), run the **WINRATE GATE** (offline calibrated
-winner-rate = hits/attempts × difficulty; see coord's winrate-gate-runbook) as the DEFAULT. Do **NOT**
-run a live **pool-credited** accepted-share A/B anymore **EXCEPT** for special bugs that only manifest
-pool-side (e.g. **stale-share testing**, or a "pool < local" discrepancy report).
-
-WHY: pool-credited resolution is Poisson-limited — resolving a ~1.4% effect at a static-diff pool needs
-~350 HOURS/arm (the CLC +1.36% ABBA on herominers left CI [-16.7%,+51.1%], p=0.45, UNRESOLVED). The
-winrate gate computes the same credited-equivalent DETERMINISTICALLY offline: ~hundreds-of-thousands of
-calibrated hits in 600s/leg → delta resolves to ~0.2-0.3% CI in minutes. This does NOT resurrect naive
-bench — the winrate gate is a calibrated credited-equivalent, not local avg_ths; iso-clock/local stays
-scouting-only.
-
-★ POOL-BLOCK WORKAROUND (for the special-bug live-pool cases + any live confirm from a rented/DC box):
-when the box's datacenter IP is RST'd/NOHASH'd by the Pearl pools, mine via the **CN2_1..CN2_8 forwarder
-IPs** (bypass the HK DC-IP RST): cn2_1=38.181.34.151 · cn2_2=207.56.227.64 · cn2_3=191.223.40.85 ·
-cn2_4=191.223.40.84 · cn2_5=191.223.40.83 · cn2_6=191.223.40.104 · cn2_7=191.223.40.103 ·
-cn2_8=191.223.40.102. herominers fwd = `stratum+ssl-insecure://191.223.40.83:1200` (ssl-insecure; worker
-name must have NO `+`).
-
-## ★★ PERF / BENCHMARK BUILD = DIST, BOTH LEGS (user standing rule, recurred 2026-06-24)
-
-Every hashrate/perf A/B number MUST be measured on a SHIP-CONSISTENT `PEARL_CUDA_ARCH=dist` build —
-NOT a single-arch (`PEARL_CUDA_ARCH=sm_XX`) or dev build. **This applies to BOTH legs: the candidate
-AND the baseline.**
-
-WHY: a single-arch / dev build compiles the GENERIC kernel. The shipped `dist` build's runtime
-dispatch routes each arch to its dedicated TUNED variant (FIXED_RANK256_/FIXED_RANK512_ + FAST_LAYOUT_
-+ PERSISTENT_CTA_ + ASSUME_FULL_TILES_ + per-arch WM/WN + SWIZZLE). The generic kernel is much slower.
-Concrete recurrence (2026-06-24): an A100 r256 BASELINE built single-arch via `add_arch_default_args`
-(which only has an sm_120a branch → sets NOTHING for sm_80) read ~52 avg_ths instead of the dist-tuned
-~184 → made rank-512 look like +263% when the real delta is ~+15%. Earlier (2026-06-15): 5070Ti
-generic ~150 vs dist ~167. **An undertuned BASELINE inflates the candidate's win just as badly as an
-undertuned candidate.**
-
-RULES:
-1. Build `PEARL_CUDA_ARCH=dist`. If you need the positional/insecure path (shape override, VALIDATE_*),
-   build `dist` + `--features insecure-transport` — ONE binary does both; insecure-transport is
-   transport-only, zero kernel/perf effect.
-2. Both A/B legs come from the SAME dist build (force the variant with PEARL_KERNEL_VARIANT, don't
-   switch to a single-arch build for either leg).
-3. Single-arch is fine ONLY for a quick functional/correctness smoke — NEVER for a number, and NEVER
-   for the baseline. (Correctness too: re-prove bit-exact in the dist-baked config, not the dev one.)
-4. coord will NOT waive this for "fallback arches" (sm_80/sm_75/etc) — those are exactly the arches
-   `add_arch_default_args` leaves untuned, so they need dist MOST.
-5. Companion rules already in coord memory: live-pool submit (not BENCH) for submit-path A/Bs;
-   power-cap awareness (log power.draw per leg); nvshare ≠ perf baseline.
-
-## ★★ BENCHMARK STRATEGY = (G + WM/WN) FIRST, THEN SHAPE (user standing rule, 2026-06-25, rev2)
-
-Every perf eval of a kernel config is TWO ORDERED STAGES — never judge from one shape at one tile config:
-1. **Find the best KERNEL TILE CONFIG first = best (G swizzle, WM/WN warp-tiling) jointly.** Sweep
-   G {8,16,32} × WM/WN {2/4, 4/2, 4/4, …valid combos} at a fixed reference shape (131072²); pick the
-   arch's best (G, WM/WN). These are L2/band-working-set + warp-tiling properties, ~per-arch / per-L2-tier.
-   (WM/WN are compile-time `-DWM_/-DWN_`; default bake is 2/4 — do NOT assume it's optimal, SWEEP it.)
-2. **THEN sweep SHAPE with best-(G,WM/WN) fixed.** Full M×N grid spanning square / tall-narrow (M<N) /
-   wide-N and several sizes (16384²/32768²/65536²/98304²/131072² + 8192x131072/16384x65536/16384x131072/
-   16384x262144/32768x131072/32768x262144 + 32768x65536/65536x131072/65536x262144). Short-scout to rank,
-   then 5-min live-pool confirm the top 3-4.
-
-Result = best-G × best-WM/WN × best-shape. Compare against the baseline at ITS shipped/auto-tuned config
-(v2.1.10 release auto-picks its own shape). WHY: all THREE tile knobs (G, WM/WN, shape) INTERACT; the
-2026-06-25 gate round swept G+shape but used baked WM2/WN4 (not re-confirmed at best-G×best-shape) — that's
-an incomplete eval. rank-512 is shape-sensitive (sm_75: 65536²=57.9 vs 131072²=44.6 = +30%); WM/WN
-historically ±1-2% but unswept-at-best-config. A forced single config UNDERSTATES and gives false par/loss.
-
-★ CORRECTNESS for tile-config (G/WM/WN/shape) sweeps: do NOT run a separate bit-exact/VALIDATE_XORED/GPU2
-gate — the live-pool A/B confirms it. A broken config → invalid shares → rejects, so 0 non-shape rejects on
-herominers during the 5-min run = correct (the pool validates the proof). These are tile-config sweeps of an
-already-validated mainloop. (A NEW kernel mainloop STILL needs bit-exact in the dist-baked config.)
+主機營運方的常設規則（使用者裁定）放在 `~/.dispatch/PROTOCOL.local.md`，`deploy/install-cli.sh` 會把它接在本檔之後寫成 `~/.dispatch/PROTOCOL.md`；不進 dispatch-mcp repo。

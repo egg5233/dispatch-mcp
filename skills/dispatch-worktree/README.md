@@ -18,7 +18,7 @@ This README walks through setting it up in your project.
 
 Ask whoever runs the dispatch-mcp server for:
 
-1. **Server URL** — e.g. `http://192.168.1.10:7900`
+1. **Server URL** — e.g. `http://<server-host>:7900`
 2. **Bearer token** — your personal token, something like `alice-1234-...`
 3. **(Optional) Dashboard password** — only if you want to use the web UI
 

@@ -5,11 +5,15 @@
 // date/git/status) plus the task's report timeline. Best-effort: a write
 // failure is logged and never fails the request that triggered it.
 import { mkdirSync, writeFileSync, readdirSync, renameSync, existsSync } from "fs";
-import { join } from "path";
+import { join, dirname } from "path";
+import { fileURLToPath } from "url";
 import { toDisplayTz } from "./tz.js";
 
-export const TASKS_DIR =
-  process.env.DISPATCH_TASKS_DIR || "/var/solana/data/pearl_workspace/coordination/tasks";
+// Fallback directory for tasks that belong to no project (or to a project
+// without a coordination_dir): DISPATCH_TASKS_DIR, else <data dir>/tasks.
+// Every registered project mirrors into its own coordination_dir/tasks/.
+const DATA_DIR = process.env.DISPATCH_DATA_DIR || join(dirname(fileURLToPath(import.meta.url)), "..", "data");
+export const TASKS_DIR = process.env.DISPATCH_TASKS_DIR || join(DATA_DIR, "tasks");
 
 // Multi-project (T-20260903-20): a task mirrors into its project's
 // coordination/tasks/. Tasks without a project (or a project without a

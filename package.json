@@ -1,12 +1,21 @@
 {
   "name": "dispatch-mcp",
   "version": "1.0.0",
-  "description": "MCP server for dispatching work between Claude Code instances",
+  "description": "Message bus + task tracker for a fleet of Claude Code / Codex agents on one host: typed messages, hook-based wake, per-project task mirrors, dashboard",
+  "license": "MIT",
+  "author": "egg5233",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/egg5233/dispatch-mcp.git"
+  },
   "type": "module",
   "main": "src/server.js",
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "start": "node src/server.js",
-    "dashboard": "node src/dashboard.js"
+    "test": "node --test test/"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1",

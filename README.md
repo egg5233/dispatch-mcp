@@ -1,8 +1,58 @@
 # dispatch-mcp
 
-A message bus for a fleet of coding agents (Claude Code and Codex sessions in tmux) plus a small task tracker and a web dashboard. One Node/Express/SQLite process on `:7900`. Agents talk to it through a bearer-authed HTTP API, a three-command shell CLI, and Claude Code hooks that surface unread messages at the right moment of a turn. The original MCP task tools are still there, one layer down.
+A message bus for a fleet of coding agents (Claude Code and Codex sessions in tmux) plus a small task tracker and a web dashboard. One Node/Express/SQLite process on `:7900`. Agents talk to it through a bearer-authed HTTP API, a three-command shell CLI, and Claude Code hooks that surface unread messages at the right moment of a turn. Several projects — each with its own coordinator agent, its agents and a `coordination/` directory — share one server. The original MCP task tools are still there, one layer down.
 
-**Message-first, since dispatch v2 (2026-09-03).** Everything below `## Server setup` is the older task/MCP material and still applies.
+**Message-first, since dispatch v2 (2026-09-03).** Everything below `## Server setup` is the older task/MCP material and still applies. License: MIT.
+
+## Requirements
+
+| what | version / note |
+|---|---|
+| Linux host with **tmux** | every agent is a tmux pane; identity = pane → `~/.dispatch/fleet.json` |
+| **Node.js ≥ 20** | server, CLI helpers, watcher (`better-sqlite3` builds a native module on `npm ci`) |
+| **Python 3.8+** (stdlib only) | the shell CLI and the hook |
+| **pm2** (`npm i -g pm2`) | keeps the server and one `watch-<handle>` per agent alive; systemd works too |
+| **Claude Code ≥ 2.1.259** with hooks | delivery at turn boundaries and idle wake (`Stop` + async `Wait` hook, `asyncRewake`); older versions fall back to the keystroke watcher |
+| **Codex CLI** (optional, 0.148+) | Codex agents get the guarded keystroke watcher only (no `Stop` hook in Codex) |
+| `git`, `curl` | onboarding script, health checks |
+
+Everything is single-host by default; agents on other machines join over an SSH tunnel to the server port (see the runbook, "Remote hosts").
+
+## Install on a fresh host
+
+```bash
+git clone https://github.com/egg5233/dispatch-mcp.git ~/dispatch-mcp && cd ~/dispatch-mcp
+npm ci
+pm2 start src/server.js --name dispatch            # or: PORT=7900 DISPATCH_BIND=127.0.0.1 node src/server.js
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:7900/login   # 200
+deploy/install-cli.sh                              # cli/* → ~/.dispatch, writes ~/.dispatch/repo
+python3 deploy/enable-hooks.py                     # adds the hook block to ~/.claude/settings.json (idempotent, --dry-run first if you like)
+node src/admin.js add user && node src/admin.js set-password user   # the human's dashboard login
+```
+
+Environment knobs (all optional): `PORT`, `DISPATCH_BIND` (default `0.0.0.0`), `DISPATCH_DATA_DIR` (default `<repo>/data`), `DISPATCH_TZ` (default: the host's zone), `JWT_SECRET`, `JWT_COOKIE_SECURE`. Set them in the pm2 environment (`VAR=… pm2 restart dispatch --update-env && pm2 save`). Full list under "Environment".
+
+## First project
+
+```bash
+mkdir -p /srv/work/web                                                    # the project's workspace (its repos live under it)
+~/.dispatch/dispatch-init-project web --workspace /srv/work/web --language English
+#   copies templates/coordination → /srv/work/web/coordination, git-inits it, registers project "web"
+#   (coordinator handle coord-web), creates tmux session "web" and launches the coordinator Claude in it
+~/.dispatch/dispatch-fleet add web-dev --project web --cwd /srv/work/web/app --runtime claude \
+    --cmd "claude --dangerously-skip-permissions"                          # one agent: new tmux window, account, watcher, waits for the prompt
+~/.dispatch/dispatch-fleet check                                          # "2 handle(s), 1 project(s), 0 problem(s)"
+```
+
+Then, as the coordinator (its tmux window, or `DISPATCH_TOKEN=<from fleet.json> DISPATCH_HANDLE=coord-web`):
+
+```bash
+~/.dispatch/dispatch-send web-dev --type task --priority high --ack auto --title "smoke test" "Ack, then report done."
+~/.dispatch/dispatch-recv                                                 # the ack and the report arrive here
+ls /srv/work/web/coordination/tasks/                                      # T-YYYYMMDD-01-smoke-test.md
+```
+
+The step-by-step version, verification and offboarding: `docs/runbooks/onboard-new-project.md`. Give every agent the standing rule in `CLAUDE_SNIPPET.md` (report to `coord` before going idle) — globally in `~/.claude/CLAUDE.md` is simplest. Dashboard: `http://<host>:7900/` (login `user`; project switcher top right).
 
 ## What It Does
 
@@ -21,7 +71,7 @@ A message bus for a fleet of coding agents (Claude Code and Codex sessions in tm
 ~/.dispatch/dispatch-recv                                         # unread, one line each
 ~/.dispatch/dispatch-recv --full 27b8b9f0                         # full text of one message
 ~/.dispatch/dispatch-send coord "short note"                      # info / medium
-~/.dispatch/dispatch-send pearl-infra --type task --title "Rotate the pool keys" --priority high --ack auto \
+~/.dispatch/dispatch-send web-infra --type task --title "Rotate the pool keys" --priority high --ack auto \
     --attach /abs/path/spec.md "Details…"                          # creates T-YYYYMMDD-NN
 ~/.dispatch/dispatch-send coord --type ack --re 27b8b9f0 "on it"
 ~/.dispatch/dispatch-send coord --type report --state done --re T-20260903-02 "[DONE] shipped"
@@ -38,9 +88,9 @@ All endpoints take `Authorization: Bearer <token>` (or `?token=`), return JSON, 
 
 ```bash
 curl -s -H "Authorization: Bearer $TOK" -H 'content-type: application/json' \
-  -d '{"to":"pearl-infra","body":"Title\nDetails","type":"task","priority":"high","ack":"auto",
+  -d '{"to":"web-infra","body":"Title\nDetails","type":"task","priority":"high","ack":"auto",
        "attachments":["/abs/path/spec.md"]}' http://127.0.0.1:7900/msg/send
-# → {"delivered":true,"id":"756dbb0c","to":"pearl-infra","type":"task","priority":"high",
+# → {"delivered":true,"id":"756dbb0c","to":"web-infra","type":"task","priority":"high",
 #    "ack_required":true,"task_id":"T-20260903-01","task":{"id":"T-20260903-01","ack_required":true,"status":"open"}}
 ```
 
@@ -151,7 +201,7 @@ dispatch-fleet add <handle> --project <p> --cwd <dir> [--runtime claude|codex] [
     --write also regenerates registry.json. remove: retire a handle from fleet.json and registry.json
     (kept in fleet.json "retired" so sync never resurrects it) and clear its server-side project;
     --watcher also pm2-deletes watch-<handle>. watchers: start (or --restart) one pm2 watch-<handle>
-    per fleet.json entry with env derived from fleet.json (watchers.<host>.cjs is deprecated).
+    per fleet.json entry with env derived from fleet.json.
     project add/remove/assign: write fleet.json AND the server (via node src/admin.js). Defaults:
     --session <name>, --coordinator coord-<name>. remove refuses while handles are still assigned.
     add: onboard one agent — new tmux window in the project's session (or --pane to register an
@@ -169,39 +219,40 @@ dispatch-fleet add <handle> --project <p> --cwd <dir> [--runtime claude|codex] [
   "version": 1,
   "generated_at": "2026-09-03 13:25:10+0800",
   "url": "http://127.0.0.1:7900",
-  "tmux_tmpdir": "/var/solana/data/tmp",
+  "tmux_tmpdir": "/tmp",
+  "repo": "/home/me/dispatch-mcp",
   "projects": {
-    "pearl":    { "coordination_dir": "/var/solana/data/pearl_workspace/coordination", "tmux_session": "pearl", "coordinator": "coord" },
-    "dispatch": { "coordination_dir": "/var/solana/data/pearl_workspace/coordination", "tmux_session": "pearl", "coordinator": "coord" }
+    "web":      { "coordination_dir": "/srv/work/web/coordination", "tmux_session": "web", "coordinator": "coord-web" },
+    "platform": { "coordination_dir": "/srv/work/web/coordination", "tmux_session": "web", "coordinator": "coord-web" }
   },
   "handles": {
-    "coord": { "token": "coord-…", "runtime": "claude", "pane": "%0", "project": "pearl",
-               "watcher": "watch-coord", "watcher_pane": "%0",
-               "session_name": "coordination-6d", "cwd": "/…/coordination", "session_id": "…" }
+    "coord-web": { "token": "coord-web-…", "runtime": "claude", "pane": "%0", "project": "web",
+                   "watcher": "watch-coord-web", "watcher_pane": "%0",
+                   "session_name": "coordination-6d", "cwd": "/srv/work/web/coordination", "session_id": "…" }
   },
-  "retired": ["dtest", "…"]
+  "retired": ["old-handle"]
 }
 ```
 
-Single source of truth on this host for handle → token / runtime / pane / project / session_name / cwd / watcher, and for the `projects` registry. `registry.json` (pane → handle/token/runtime) is kept as a derived file for `dispatch-common.sh` and the watcher's expected-command lookup. `session_name` is whatever `~/.claude/sessions/<pid>.json` reported at sync time — it changes on every session restart, so treat it as a cache.
+Single source of truth on this host for handle → token / runtime / pane / project / session_name / cwd / watcher, and for the `projects` registry. `tmux_tmpdir` is only needed when the tmux server runs on a non-default socket dir; `repo` (or `~/.dispatch/repo`, written by `deploy/install-cli.sh`) tells the installed CLIs where `src/admin.js` and the watcher script live. `registry.json` (pane → handle/token/runtime) is kept as a derived file for `dispatch-common.sh` and the watcher's expected-command lookup. `session_name` is whatever `~/.claude/sessions/<pid>.json` reported at sync time — it changes on every session restart, so treat it as a cache.
 
 ## Projects (multi-project, T-20260903-20)
 
 One server, one DB, one dashboard serve several projects on the host. A **project** = a coordinator session, its agents and a `coordination/` directory. Handles stay globally unique; each belongs to at most one project (`user`, the human decision account, belongs to none).
 
-- **Registry.** `fleet.json` has `projects.<name> = {coordination_dir, tmux_session, coordinator}` and every handle carries `project`. The server keeps the same data in its DB (`projects` table, `users.project`) — that is the truth for remote (i5) handles too — and `dispatch-fleet project …` / `dispatch-fleet add` write both. `dispatch-fleet check` flags any disagreement.
-- **`coord` alias.** `dispatch-send coord …` (the global CLAUDE.md standing rule) is resolved *by the server* to the sender's project coordinator. Pearl's coordinator is the literal handle `coord`, so Pearl agents, `user`, and handles without a project are unchanged. A project whose coordinator has no account gets a 404 instead of a misrouted message.
-- **Tasks.** A `type=task` message is filed under the sender's project (override with `--project`, fallback: the recipient's). Its markdown mirror goes to `<coordination_dir>/tasks/` of that project; Pearl's path and file format are byte-for-byte what they were (no new frontmatter key). A project without `coordination_dir`, or a task without a project, uses `DISPATCH_TASKS_DIR`.
+- **Registry.** `fleet.json` has `projects.<name> = {coordination_dir, tmux_session, coordinator}` and every handle carries `project`. The server keeps the same data in its DB (`projects` table, `users.project`) — that is the truth for handles on other hosts too — and `dispatch-fleet project …` / `dispatch-fleet add` write both. `dispatch-fleet check` flags any disagreement.
+- **`coord` alias.** `dispatch-send coord …` (the global CLAUDE.md standing rule) is resolved *by the server* to the sender's project coordinator. A project whose coordinator is literally named `coord`, the `user` account, and handles without a project are unaffected. A project whose coordinator has no account gets a 404 instead of a misrouted message.
+- **Tasks.** A `type=task` message is filed under the sender's project (override with `--project`, fallback: the recipient's). Its markdown mirror goes to `<coordination_dir>/tasks/` of that project. A project without `coordination_dir`, or a task without a project, uses `DISPATCH_TASKS_DIR` (default `<data dir>/tasks`).
 - **Dashboard.** The header has a project switcher (all / one project) that scopes inbox strip, filters, composer, task board (tasks of the project + tasks assigned to its agents), decisions and the Fleet tab; the choice is remembered per browser (`localStorage`). `/api/inbox|messages|tasks|decisions|fleet|tasks/mirror-all` accept `?project=`.
-- **Platform project.** `dispatch-dev` is in project `dispatch`, coordinated by Pearl's `coord` (same coordination dir), so every coordinator can address it and its reports still go to `coord`. Everything else on this host and on i5 is `pearl`.
+- **Platform project.** An agent that serves every project (the one maintaining dispatch itself, say) can sit in its own project whose `coordinator` is an existing project's coordinator and whose `coordination_dir` is that project's — every coordinator can address it directly, and its reports still go to its coordinator.
 
-Onboarding a project (the runbook `docs/runbooks/onboard-new-project.md` wraps this):
+Onboarding a project by hand (`dispatch-init-project` and the runbook `docs/runbooks/onboard-new-project.md` wrap this):
 
 ```
-dispatch-fleet project add byreal --dir /var/solana/data/byreal/coordination --session byreal --coordinator coord-byreal
-dispatch-fleet add coord-byreal --project byreal --cwd /var/solana/data/byreal/coordination --runtime claude
-dispatch-fleet add byreal-dev   --project byreal --pane %12 --runtime claude      # existing pane; cwd = the pane's
-dispatch-fleet check                                                              # 0 problems
+dispatch-fleet project add api --dir /srv/work/api/coordination --session api --coordinator coord-api
+dispatch-fleet add coord-api --project api --cwd /srv/work/api/coordination --runtime claude
+dispatch-fleet add api-dev   --project api --pane %12 --runtime claude      # existing pane; cwd = the pane's
+dispatch-fleet check                                                        # 0 problems
 ```
 
 Offboarding: `dispatch-fleet remove <handle> --watcher` for each handle (clears its server-side project), then `dispatch-fleet project remove <name>`.
@@ -243,7 +294,9 @@ Every server call has a ≤ 2 s timeout; if the server is unreachable the hook e
 |---|---|---|
 | `PORT` | `7900` | listen port |
 | `DISPATCH_DATA_DIR` | `<repo>/data` | DB location (tests point this at a temp dir) |
-| `DISPATCH_TZ` / `DISPATCH_TZ_SUFFIX` | `Asia/Taipei` / `+08` | display zone for agent-facing timestamps and task-id dates |
+| `DISPATCH_BIND` | `0.0.0.0` | listen address; `127.0.0.1` when every client is local or tunnelled |
+| `DISPATCH_TZ` / `DISPATCH_TZ_SUFFIX` | the host's zone / its UTC offset (`+08`, `-04`, `+05:30`, DST-aware) | display zone for agent-facing timestamps and task-id dates |
+| `DISPATCH_TASKS_DIR` | `<data dir>/tasks` | mirror dir for tasks that have no project (registered projects use their own `coordination_dir/tasks`) |
 | `DISPATCH_BODY_MAX` | `1500` | body limit in code points |
 | `DISPATCH_WAIT_MAX_S` | `280` | cap on `/msg/wait` timeout |
 | `JWT_SECRET`, `JWT_COOKIE_SECURE` | generated / unset | dashboard cookie (see Dashboard) |
@@ -260,7 +313,7 @@ Codex CLI 0.148.0 ships lifecycle hooks (`codex features list` → `hooks stable
 
 ## Installing the CLI to `~/.dispatch`
 
-`deploy/install-cli.sh` copies `cli/*` into `~/.dispatch` (idempotent; `--check` only reports drift). Run it after every pull that touches `cli/` — the hook and CLI run from `~/.dispatch`, not from the checkout, and a forgotten copy once left the hook without its delivery-record code for hours.
+`deploy/install-cli.sh` copies `cli/*` into `~/.dispatch` (idempotent; `--check` only reports drift), writes `~/.dispatch/repo` (the checkout path the installed CLIs use to find `src/admin.js` and the watcher script) and assembles `~/.dispatch/PROTOCOL.md` from `cli/PROTOCOL.md` plus an optional `~/.dispatch/PROTOCOL.local.md` — the place for an operator's own standing rules, which therefore never enter this repo. Run it after every pull that touches `cli/` — the hook and CLI run from `~/.dispatch`, not from the checkout, and a forgotten copy once left the hook without its delivery-record code for hours.
 
 ## Tests
 
@@ -276,9 +329,9 @@ bash test/guards.sh        # live tmux: dead-pane guard in the watcher and in di
 ### 1. Install on your shared server
 
 ```bash
-git clone <this-repo> ~/dispatch-mcp
+git clone https://github.com/egg5233/dispatch-mcp.git ~/dispatch-mcp
 cd ~/dispatch-mcp
-npm install
+npm ci            # Node ≥ 20; better-sqlite3 compiles a native module (build-essential / python3 on Debian-likes)
 ```
 
 ### 2. Run it
@@ -583,3 +636,6 @@ All data is stored in `data/dispatch.db` (SQLite). Delete it to start fresh — 
 - **Rotation.** `node src/admin.js rotate <handle>` issues a new bearer token (old one stops working). `node src/admin.js set-password <handle>` overwrites the password hash. Already-issued JWTs remain valid until they expire (24h max) — to invalidate them all immediately, change `JWT_SECRET` and restart.
 - **TLS.** Tokens and cookies travel in clear unless you put the server behind TLS (nginx / caddy / a tunnel). Once TLS is in place, set `JWT_COOKIE_SECURE=1` so the cookie refuses to ride over plain HTTP.
 - **JWT secret.** Set `JWT_SECRET` in the environment for control over rotation. Otherwise the server generates one on first boot and stores it in the `settings` table — restarts won't invalidate sessions, but wiping `data/dispatch.db` will.
+- **Port exposure.** The server listens on `0.0.0.0:7900` by default so LAN peers and the dashboard can reach it; everything on it is authenticated, but the bearer tokens ride in clear without TLS. On a shared network set `DISPATCH_BIND=127.0.0.1` and reach it over SSH tunnels (that is how remote agents connect anyway), or firewall the port to the hosts that need it. Never expose it to the internet without TLS in front.
+- **Token files on the host.** `~/.dispatch/fleet.json` and `registry.json` hold every local agent's bearer token in clear (they have to: the CLI resolves identity from the tmux pane). Keep `~/.dispatch` at mode 700 and treat those files like an SSH key. `dispatch-fleet show` prints them redacted. The task mirror files under `coordination/tasks/` contain message text, not credentials.
+- **What agents can do with a token.** A token lets its holder send as that handle, read that handle's inbox, and read `/fleet` (every handle's unread counts and open tasks). It cannot read other handles' directed messages, log in to the dashboard, or manage users — those need `src/admin.js` on the host.

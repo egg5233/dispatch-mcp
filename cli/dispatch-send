@@ -6,8 +6,8 @@ usage: dispatch-send <to|all|coord> [--type T] [--title "<task title>"] [--prior
                      [--project <name>] [--attach <path>]... [--force] [--json] "<body>"
 
 <to> = a handle, "all" (broadcast) or "coord" = YOUR project's coordinator
-(resolved by the server from fleet.json's projects; Pearl's coordinator is the
-literal handle coord, so nothing changes there). --project files a type=task
+(resolved by the server from the project registry; a project whose coordinator
+is literally named coord is unaffected). --project files a type=task
 under another project (default: the sender's project → its coordination/tasks/).
 
 --title (type=task, recommended): the task's title as stored in the tasks table

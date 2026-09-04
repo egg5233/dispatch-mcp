@@ -12,18 +12,18 @@ supersedes:
 
 One host, one operator, several projects, one dispatch server. Each project gets its own coordinator session, its own agents, its own `coordination/` directory and its own tmux session; the server, CLI, hooks and dashboard are shared. This runbook takes a project from "a directory on disk" to "coordinator and agents exchanging tasks", and back out again.
 
-Vocabulary (spec: `coordination/docs/designs/dispatch-multiproject-spec-20260903.md` in Pearl's coordination):
+Vocabulary (the multi-project model is described in the README, "Projects"):
 
 | thing | rule |
 |---|---|
 | project name | lowercase, `[a-z0-9-]`, unique on the server; also the tmux session name |
-| coordinator handle | `coord-<project>` (Pearl keeps the literal `coord`) |
+| coordinator handle | `coord-<project>` (a first project may keep the literal `coord`) |
 | agent handles | `<project>-<role>`, globally unique across all projects |
 | `coord` | every agent addresses its own coordinator as `coord`; the server resolves it by the sender's project |
 | coordination dir | `<workspace>/coordination`, created from `templates/coordination/` |
 | task mirror | `<workspace>/coordination/tasks/T-YYYYMMDD-NN-<slug>.md`, written by the server |
 
-> **Version note.** Steps that call `dispatch-fleet project …` and `dispatch-fleet add … --project` need the multi-project CLI (dispatch-mcp Task A of the spec above). If `~/.dispatch/dispatch-fleet project list` prints a usage error, pull the repo and run `deploy/install-cli.sh` first. The exact flag names are those printed by `dispatch-fleet --help`; when this file and `--help` disagree, `--help` wins and this file gets fixed.
+> **Version note.** Steps that call `dispatch-fleet project …` and `dispatch-fleet add … --project` need the multi-project CLI (dispatch-mcp ≥ 2026-09-03). If `~/.dispatch/dispatch-fleet project list` prints a usage error, pull the repo and run `deploy/install-cli.sh` first. The exact flag names are those printed by `dispatch-fleet --help`; when this file and `--help` disagree, `--help` wins and this file gets fixed.
 
 ## 0. Prerequisites (once per host)
 
@@ -35,26 +35,26 @@ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:7900/login   # 200
 ~/.dispatch/dispatch-fleet check                          # existing fleet: "0 problem(s)"
 deploy/install-cli.sh --check                             # from the dispatch-mcp checkout: "~/.dispatch is up to date"
 python3 - <<'PY'
-import json; h=json.load(open('/home/solana/.claude/settings.json'))['hooks']
+import json, os; h=json.load(open(os.path.expanduser('~/.claude/settings.json')))['hooks']
 print('dispatch hooks:', all(any('dispatch/hook.sh' in x.get('command','') for g in h.get(ev,[]) for x in g['hooks']) for ev in ('SessionStart','Stop','PreToolUse')))
 PY
 which tmux claude git
 ```
 
-What each line proves: the server is up; the CLI in `~/.dispatch` matches the repo (the hooks and CLI run from `~/.dispatch`, not from the checkout); the global Claude Code hooks that deliver messages are installed (`deploy/enable-hooks.py` if not); the runtimes exist. The `~/.claude/CLAUDE.md` standing rule ("report to `coord` on idle") is global and needs no change per project.
+What each line proves: the server is up; the CLI in `~/.dispatch` matches the repo (the hooks and CLI run from `~/.dispatch`, not from the checkout); the global Claude Code hooks that deliver messages are installed (`deploy/enable-hooks.py` if not); the runtimes exist. The `~/.claude/CLAUDE.md` standing rule ("report to `coord` on idle", see `CLAUDE_SNIPPET.md`) is global and needs no change per project.
 
 The dashboard login `user` is one global identity; nothing per project.
 
 ## 1. Initialize the project
 
 ```bash
-~/.dispatch/dispatch-init-project <name> --workspace <dir> [--coordinator coord-<name>]
+~/.dispatch/dispatch-init-project <name> --workspace <dir> [--coordinator coord-<name>] [--language <name>]
 ```
 
 What it does, in order (each step is skipped if already done, so the command is safe to re-run):
 
 1. Validates the name and that `<dir>` exists.
-2. Copies `templates/coordination/` to `<dir>/coordination`, substituting `{{PROJECT}}`, `{{WORKSPACE}}`, `{{COORDINATOR}}`, `{{DATE}}` in the copied files. Existing files are never overwritten.
+2. Copies `templates/coordination/` to `<dir>/coordination`, substituting `{{PROJECT}}`, `{{WORKSPACE}}`, `{{COORDINATOR}}`, `{{DATE}}` and `{{LANGUAGE}}` (the language the coordinator talks to the user in; `--language`, default English) in the copied files. Existing files are never overwritten.
 3. `git init` in `<dir>/coordination` (if not a repo) and a first commit.
 4. `dispatch-fleet project add <name> --dir <dir>/coordination --session <name> --coordinator <handle>` — registers the project so task mirrors land in this directory and `coord` resolves to this coordinator.
 5. Creates the tmux session `<name>` if it does not exist (`tmux new-session -d -s <name> -c <dir>`).
@@ -132,7 +132,7 @@ Scripted evidence without the browser: `/api/*` needs the dashboard cookie (bear
 
 Record the evidence (the task id, the mirror path, a dashboard screenshot or the fleet check output) in the new project's `STATUS.md` as its first real entry.
 
-## 4. Remote hosts (i5-style)
+## 4. Remote hosts
 
 An agent on another machine can be part of a project without a local pane:
 
@@ -141,7 +141,7 @@ An agent on another machine can be part of a project without a local pane:
 3. If the remote runs Claude Code, install the hooks there too (`deploy/enable-hooks.py`) so it gets the same digest/block/wake behaviour; without hooks it must poll `dispatch-recv` itself.
 4. It shows up in the dashboard's **remote** section (handles on the server that are not in the local fleet), with last-seen time and IP, and in the project it was added to.
 
-The worked example on this host is Pearl's i5 agent: `pearl_workspace/coordination/docs/runbooks/pearl-i5-agent-setup.md` (ControlMaster socket, mirror rsync, fallback outbox).
+Operators keep their own worked example (tunnel unit, ControlMaster socket, mirror sync) next to their coordination docs; this runbook stays generic.
 
 ## 5. Offboard a project
 
@@ -166,7 +166,7 @@ tmux kill-session -t <name>                                    # optional; the u
 | `check` shows watcher `stopped` / missing | pm2 process not started or crashed | `dispatch-fleet watchers --only <handle> --restart`; `pm2 logs watch-<handle>` |
 | coordinator launched but stuck on the trust dialog | `dispatch-fleet add` did not get the prompt in time | attach, answer the dialog, run `dispatch-fleet sync --write` so the session name is recorded |
 | agent never wakes on a `high` task | hooks not installed in that Claude session, or the message went to a handle in another project | `python3` prerequisite check above; `dispatch-recv --peek` as the agent; confirm the handle's project |
-| `coord` from the agent reaches Pearl's coordinator | the agent's handle has no project (or the wrong one) in `fleet.json` | `dispatch-fleet add … --project <name>` again, or edit the project field and `dispatch-fleet sync --write` |
+| `coord` from the agent reaches another project's coordinator | the agent's handle has no project (or the wrong one) in `fleet.json` | `dispatch-fleet add … --project <name>` again, or edit the project field and `dispatch-fleet sync --write` |
 | mirror file does not appear in `<dir>/coordination/tasks/` | project registered with the wrong dir, or dir not writable by the server user | `dispatch-fleet project list`; fix with `project add` (idempotent) |
 | handle already exists (another project) | handles are global | pick `<name>-<role>`; never reuse a retired name without `dispatch-fleet remove` first |
 | `install-cli.sh --check` reports STALE after a pull | `~/.dispatch` was not refreshed | run `deploy/install-cli.sh` (no `--check`) |

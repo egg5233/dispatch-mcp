@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # dispatch-init-project — create a project's coordination/ from the template and register it with dispatch.
 #
-#   dispatch-init-project <name> --workspace <dir> [--coordinator <handle>] [--cmd "<launch cmd>"] [--dry-run] [--no-launch]
+#   dispatch-init-project <name> --workspace <dir> [--coordinator <handle>] [--language <name>] [--cmd "<launch cmd>"] [--dry-run] [--no-launch]
 #
 # Steps (each skipped when already done, so re-running is safe):
 #   1 validate name ([a-z0-9-]) and workspace dir
@@ -13,20 +13,23 @@
 #   6 dispatch-fleet add <handle> --project <name> --cwd <dir>/coordination --runtime claude --session <name> --window coord
 #     --cmd "claude --dangerously-skip-permissions" (the fleet's launch command; unattended agents cannot answer permission dialogs)
 # Template location: $DISPATCH_REPO/templates/coordination, else the checkout this script lives in,
-# else fleet.json "repo", else /var/solana/data/dispatch-mcp.
+# else fleet.json "repo", else ~/.dispatch/repo (written by deploy/install-cli.sh).
+# --language <name> fills {{LANGUAGE}} in the coordinator CLAUDE.md (the language it talks to the user in; default English).
 set -euo pipefail
 
 usage() { sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-1}"; }
 die() { echo "dispatch-init-project: $*" >&2; exit 1; }
 say() { echo "[$1]$([ "$DRY" = 1 ] && echo " (dry-run)") $2"; }
 
-NAME=""; WS=""; COORD=""; DRY=0; LAUNCH=1; CMD="claude --dangerously-skip-permissions"
+NAME=""; WS=""; COORD=""; DRY=0; LAUNCH=1; CMD="claude --dangerously-skip-permissions"; LANGUAGE="English"
 while [ $# -gt 0 ]; do
   case "$1" in
     --workspace|-w) WS="${2:-}"; shift 2 ;;
     --workspace=*) WS="${1#*=}"; shift ;;
     --coordinator|-c) COORD="${2:-}"; shift 2 ;;
     --coordinator=*) COORD="${1#*=}"; shift ;;
+    --language|-l) LANGUAGE="${2:-}"; shift 2 ;;
+    --language=*) LANGUAGE="${1#*=}"; shift ;;
     --cmd) CMD="${2:-}"; shift 2 ;;
     --cmd=*) CMD="${1#*=}"; shift ;;
     --dry-run) DRY=1; shift ;;
@@ -52,15 +55,16 @@ HERE="$(cd "$(dirname "$(realpath "$0")")" && pwd)"
 REPO="${DISPATCH_REPO:-}"
 [ -z "$REPO" ] && [ -d "$HERE/../templates/coordination" ] && REPO="$(cd "$HERE/.." && pwd)"
 [ -z "$REPO" ] && [ -f "$DISPATCH_HOME/fleet.json" ] && REPO="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("repo",""))' "$DISPATCH_HOME/fleet.json" 2>/dev/null || true)"
-[ -z "$REPO" ] && REPO=/var/solana/data/dispatch-mcp
+[ -z "$REPO" ] && [ -f "$DISPATCH_HOME/repo" ] && REPO="$(cat "$DISPATCH_HOME/repo")"
+[ -n "$REPO" ] || die "cannot locate the dispatch-mcp checkout (set DISPATCH_REPO or run deploy/install-cli.sh from the checkout)"
 TPL="$REPO/templates/coordination"
 [ -d "$TPL" ] || die "template dir not found: $TPL (set DISPATCH_REPO)"
 DATE="$(date +%F)"
 
 run() { if [ "$DRY" = 1 ]; then echo "  would: $*"; else "$@"; fi; }
-subst() { sed -e "s|{{PROJECT}}|$NAME|g" -e "s|{{WORKSPACE}}|$WS|g" -e "s|{{COORDINATOR}}|$COORD|g" -e "s|{{DATE}}|$DATE|g"; }
+subst() { sed -e "s|{{PROJECT}}|$NAME|g" -e "s|{{WORKSPACE}}|$WS|g" -e "s|{{COORDINATOR}}|$COORD|g" -e "s|{{DATE}}|$DATE|g" -e "s|{{LANGUAGE}}|$LANGUAGE|g"; }
 
-echo "project=$NAME workspace=$WS coordination=$CDIR coordinator=$COORD template=$TPL$([ "$DRY" = 1 ] && echo ' (dry-run)')"
+echo "project=$NAME workspace=$WS coordination=$CDIR coordinator=$COORD language=$LANGUAGE template=$TPL$([ "$DRY" = 1 ] && echo ' (dry-run)')"
 
 # --- 2 copy template --------------------------------------------------------------------------
 copied=0; kept=0

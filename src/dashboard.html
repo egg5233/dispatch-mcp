@@ -206,7 +206,7 @@
     <div class="card" id="fleet-projects" style="font-family:var(--mono);font-size:12px;display:flex;gap:8px;flex-wrap:wrap"></div>
     <div class="section-title">Fleet 健康（伺服器端執行 dispatch-fleet check，每 5 秒快取）<span id="fleet-when" class="dim" style="font-family:var(--mono);font-size:11px;letter-spacing:0"></span></div>
     <div class="card" style="overflow:auto"><table id="fleet-table"></table></div>
-    <div class="section-title">Remote（伺服器有帳號、但不在本機 fleet.json 的 handle，例如 i5 上的 agent）</div>
+    <div class="section-title">Remote（伺服器有帳號、但不在本機 fleet.json 的 handle，例如另一台主機上的 agent）</div>
     <div class="card" style="overflow:auto"><table id="remote-table"></table></div>
     <details class="card" style="margin-top:12px"><summary style="cursor:pointer;font-family:var(--mono);font-size:12px;color:var(--text-dim)">已退役 handle（<span id="retired-count">0</span>）— 不再列於 fleet，名字相近時請對照這裡</summary><div id="retired-list" style="font-family:var(--mono);font-size:12px;margin-top:8px;color:var(--text-dim)"></div></details>
   </div>
@@ -294,7 +294,7 @@ function renderInbox(){
   // every non-retired handle, local first then remote (server already sorts); the
   // `user` decision account is a human, shown last as remote.
   const rows=ib.handles;
-  $('inbox-stats').innerHTML=rows.length?rows.map(h=>`<div class="card stat-card ${h.kind==='remote'?'remote':''}"><div class="label">${esc(h.handle)} ${PROJECT==='all'?projTag(h.project):''}${h.kind==='remote'?'<span class="tag via" title="不在本機 fleet.json（例如 i5）">remote</span>':''} <span class="${h.state==='busy'?'warn':h.state==='idle'?'ok':'dim'}">${esc(h.state||'')}</span></div><div class="value ${h.unread_high_plus?'bad':h.unread?'warn':'ok'}">${h.unread}</div><div class="dim" style="font-family:var(--mono);font-size:10px">${h.oldest_unread_age_s!=null?'最舊未讀 '+ago(h.oldest_unread_age_s):'無未讀'}${h.unacked_tasks.length?' · 未ack '+h.unacked_tasks.join(','):''}${h.open_tasks.length?' · open '+h.open_tasks.length:''}${h.kind==='remote'?'<br>last seen '+esc(h.last_seen_at||'never')+(h.last_seen_ip?' · '+esc(h.last_seen_ip):''):''}</div></div>`).join(''):'<div class="card stat-card"><div class="label">inbox</div><div class="value ok">0</div></div>';
+  $('inbox-stats').innerHTML=rows.length?rows.map(h=>`<div class="card stat-card ${h.kind==='remote'?'remote':''}"><div class="label">${esc(h.handle)} ${PROJECT==='all'?projTag(h.project):''}${h.kind==='remote'?'<span class="tag via" title="不在本機 fleet.json（例如另一台主機）">remote</span>':''} <span class="${h.state==='busy'?'warn':h.state==='idle'?'ok':'dim'}">${esc(h.state||'')}</span></div><div class="value ${h.unread_high_plus?'bad':h.unread?'warn':'ok'}">${h.unread}</div><div class="dim" style="font-family:var(--mono);font-size:10px">${h.oldest_unread_age_s!=null?'最舊未讀 '+ago(h.oldest_unread_age_s):'無未讀'}${h.unacked_tasks.length?' · 未ack '+h.unacked_tasks.join(','):''}${h.open_tasks.length?' · open '+h.open_tasks.length:''}${h.kind==='remote'?'<br>last seen '+esc(h.last_seen_at||'never')+(h.last_seen_ip?' · '+esc(h.last_seen_ip):''):''}</div></div>`).join(''):'<div class="card stat-card"><div class="label">inbox</div><div class="value ok">0</div></div>';
 }
 async function loadInbox(){state.inbox=await j(`${API}/inbox${pq()}`);renderInbox();}
 

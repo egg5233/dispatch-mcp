@@ -280,7 +280,7 @@ function checkGuards(cb) {
       // ── Guard A0: dead pane (T-20260903-16) ──
       // A pane whose process exited (remain-on-exit) keeps reporting its LAST
       // #{pane_current_command} — e.g. "claude" — so guard A alone would call
-      // it a live agent. Measured by pearl-infra on i5. Always on, even with
+      // it a live agent. Measured on a remote agent host. Always on, even with
       // GUARDS_OFF: typing into a dead pane can never do anything useful.
       if (paneDead) {
         return cb(false, `pane dead (exit status ${deadStatus || "?"}) — last command "${cmd}" is not running`);

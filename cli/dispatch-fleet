@@ -53,12 +53,24 @@ FLEET_PATH = os.path.join(D.CFG, "fleet.json")
 REG_PATH = os.path.join(D.CFG, "registry.json")
 PROJECT_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")
 HANDLE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
-DEFAULT_REPO = "/var/solana/data/dispatch-mcp"
+HERE = os.path.dirname(os.path.realpath(__file__))
 
 
 def repo_path(fleet=None):
+    """The dispatch-mcp checkout (for src/admin.js and the watcher script):
+    $DISPATCH_REPO, else fleet.json "repo", else ~/.dispatch/repo (written by
+    deploy/install-cli.sh), else the checkout this script is run from."""
     fleet = fleet if fleet is not None else (D.load_fleet() or {})
-    return fleet.get("repo") or os.environ.get("DISPATCH_REPO") or DEFAULT_REPO
+    cands = [os.environ.get("DISPATCH_REPO"), fleet.get("repo")]
+    try:
+        cands.append(open(os.path.join(D.CFG, "repo")).read().strip())
+    except OSError:
+        pass
+    cands.append(os.path.abspath(os.path.join(HERE, "..")))
+    for c in cands:
+        if c and os.path.exists(os.path.join(c, "src", "admin.js")):
+            return c
+    D.die("cannot locate the dispatch-mcp checkout — set $DISPATCH_REPO, fleet.json \"repo\", or run deploy/install-cli.sh from the checkout (it writes ~/.dispatch/repo)")
 
 
 def admin(args, timeout=30, must=True):
@@ -87,10 +99,13 @@ def admin(args, timeout=30, must=True):
 
 
 def ensure_tmux_env():
-    """pm2 / cron callers have no TMUX_TMPDIR; take it from fleet.json."""
+    """pm2 / cron callers have no TMUX_TMPDIR; take it from fleet.json when the
+    host runs its tmux server on a non-default socket dir (otherwise tmux's own
+    default applies)."""
     if not os.environ.get("TMUX_TMPDIR"):
         f = D.load_fleet() or {}
-        os.environ["TMUX_TMPDIR"] = f.get("tmux_tmpdir") or "/var/solana/data/tmp"
+        if f.get("tmux_tmpdir"):
+            os.environ["TMUX_TMPDIR"] = f["tmux_tmpdir"]
 
 
 def parse_args(args, value_flags=(), bool_flags=()):
@@ -212,11 +227,13 @@ def build_fleet(prune=False):
         "version": 1,
         "generated_at": time.strftime("%Y-%m-%d %H:%M:%S%z"),
         "url": old.get("url") or D.server_url(),
-        "tmux_tmpdir": old.get("tmux_tmpdir") or os.environ.get("TMUX_TMPDIR") or "/var/solana/data/tmp",
+        "tmux_tmpdir": old.get("tmux_tmpdir") or os.environ.get("TMUX_TMPDIR") or None,
         "projects": old.get("projects") or {},
         "handles": dict(sorted(handles.items())),
         "retired": sorted(retired),
     }
+    if not out["tmux_tmpdir"]:
+        del out["tmux_tmpdir"]
     if old.get("repo"):
         out["repo"] = old["repo"]
     return out, pruned
@@ -615,7 +632,7 @@ def cmd_add(args):
     return 0 if ok else 1
 
 
-WATCHER_SCRIPT = "/var/solana/data/dispatch-mcp/skills/dispatch-worktree/scripts/dispatch-watch.js"
+WATCHER_REL = os.path.join("skills", "dispatch-worktree", "scripts", "dispatch-watch.js")
 WATCHER_PROMPT = ("Run ~/.dispatch/dispatch-recv to read new dispatch message(s), act on them, "
                   "then reply with ~/.dispatch/dispatch-send <who> ...")
 
@@ -624,7 +641,9 @@ def cmd_watchers(restart, only):
     fleet = D.load_fleet()
     if not fleet:
         D.die("no fleet.json at %s — run: dispatch-fleet sync" % FLEET_PATH)
-    script = os.environ.get("DISPATCH_WATCHER_SCRIPT") or WATCHER_SCRIPT
+    script = os.environ.get("DISPATCH_WATCHER_SCRIPT") or os.path.join(repo_path(fleet), WATCHER_REL)
+    if not os.path.exists(script):
+        D.die("watcher script not found: %s" % script)
     existing = pm2_watchers()
     rc_all = 0
     for h, ent in sorted(fleet["handles"].items()):
@@ -642,12 +661,13 @@ def cmd_watchers(restart, only):
             "DISPATCH_URL": (fleet.get("url") or D.server_url()) + "/events",
             "DISPATCH_TOKEN": ent["token"],
             "TMUX_TARGET": ent["pane"],
-            "TMUX_TMPDIR": fleet.get("tmux_tmpdir") or os.environ.get("TMUX_TMPDIR") or "/var/solana/data/tmp",
             "DISPATCH_PROMPT": WATCHER_PROMPT,
             "DISPATCH_IDLE_POLL_MS": "1500",
             "DISPATCH_MIN_WAKE_PRIORITY": os.environ.get("DISPATCH_MIN_WAKE_PRIORITY", "medium"),
             "DISPATCH_FLEET": FLEET_PATH,
         })
+        if fleet.get("tmux_tmpdir") or os.environ.get("TMUX_TMPDIR"):
+            env["TMUX_TMPDIR"] = fleet.get("tmux_tmpdir") or os.environ.get("TMUX_TMPDIR")
         if h in existing:
             if not restart:
                 print("%s: already running (pane %s) — use --restart to re-derive env" % (name, existing[h]["pane"]))
@@ -762,7 +782,7 @@ def cmd_check(as_json=False):
     # ~/.dispatch vs repo drift (T-20260903-10): the hook and CLI run from
     # ~/.dispatch; a stale copy there was one root cause of the triple-wake
     # incident. deploy/install-cli.sh --check reports each differing file.
-    repo = (fleet.get("repo") or os.environ.get("DISPATCH_REPO") or "/var/solana/data/dispatch-mcp")
+    repo = repo_path(fleet)
     drift = []
     chk = os.path.join(repo, "deploy", "install-cli.sh")
     if os.path.exists(chk):

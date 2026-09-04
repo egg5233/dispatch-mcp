@@ -87,6 +87,9 @@ import {
 } from "./auth.js";
 
 const PORT = process.env.PORT || 7900;
+// Bind address. 0.0.0.0 serves LAN peers and the dashboard from other machines;
+// set DISPATCH_BIND=127.0.0.1 when every client is local or comes in over a tunnel.
+const BIND = process.env.DISPATCH_BIND || "0.0.0.0";
 
 // ── Event bus (for /events SSE stream) ─────────────────────────────
 //
@@ -941,8 +944,8 @@ function handleSend(identity, payload) {
   if (!body || typeof body !== "string") return bad(400, "body (string) is required");
   // `coord` is an alias for the sender's project coordinator (multi-project
   // D3): the global CLAUDE.md rule "dispatch-send coord ..." keeps working in
-  // every project. Pearl's coordinator IS the literal handle `coord`, so Pearl
-  // agents (and senders with no project) are untouched. A project whose
+  // every project. A project whose coordinator IS the literal handle `coord`
+  // (and senders with no project) are untouched. A project whose
   // coordinator has no server account fails loudly instead of misrouting.
   let alias = null;
   if (to === "coord") {
@@ -1469,7 +1472,7 @@ function fleetCheck(cb) {
 
 // Local rows come from dispatch-fleet check (this host's tmux panes).
 // `remote` = server users that are neither in fleet.json nor retired — agents
-// on other hosts (i5 …) reached over the tunnel. `retired` is fleet.json's
+// on other hosts reached over a tunnel. `retired` is fleet.json's
 // list, shown collapsed so look-alike names (codex vs kernel-codex) don't
 // confuse anyone.
 function localFleetFile() {
@@ -1717,7 +1720,7 @@ app.get("/", requireJwt, (req, res) => {
 
 // ── Start ──────────────────────────────────────────────────────────
 
-app.listen(PORT, "0.0.0.0", () => {
+app.listen(PORT, BIND, () => {
   const p = String(PORT).padEnd(5);
   console.log(`
 ╔══════════════════════════════════════════════════╗

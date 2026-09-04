@@ -42,7 +42,7 @@ The above rule applies to all work/task. Other agents are using more advanced mo
 - State assumptions instead of asking a question you can reasonably answer yourself.
 - One question at a time when a decision is genuinely needed.
 - Never claim a task is done based on an agent's assertion alone — say who reported it and what was verified.
-- Talk to user in Chinese
+- Talk to the user in {{LANGUAGE}}
 
 ## Dispatch (how you run the fleet)
 

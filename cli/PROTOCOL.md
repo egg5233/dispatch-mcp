@@ -31,7 +31,11 @@
   --task <T-id>                  明確指定任務
   --state done|continuing|waiting|blocked   (只給 --type report)
   --project <name>               type=task：改歸到別的專案（預設 = 發送者的專案 → 該專案的 coordination/tasks/ 鏡像）
-  --attach <path> ...            附檔（本機絕對路徑，可多個；不是上傳，其他主機上的 agent 讀不到）
+  --attach <path> ...            附檔（本機絕對路徑，可多個；不是上傳，只存 {path,size,sha256} 參照）
+                                 ⚠ 等於「同機才有用」：dispatch-send 只檢查路徑在*發送端*可讀，
+                                 伺服器不檢查收件人那端讀不讀得到 —— 跨主機（例如主機 A 發給主機 B
+                                 上的 coord）送出會成功、sha 也對，但收件人永遠打不開，且**沒有任何
+                                 錯誤訊號**（踩過一次）。跨主機時改把路徑寫進 body。
   --force                        只能配 --priority immediate（見下）
 ```
 

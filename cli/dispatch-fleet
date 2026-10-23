@@ -49,6 +49,9 @@ sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import dispatchlib as D  # noqa: E402
 
 RUNTIME_CMD = {"claude": "claude", "codex": "node"}
+# a pane-less automated sender (e.g. rental-watchdog, run by a systemd unit with its token in an
+# EnvironmentFile): no tmux pane, no watcher, no token in fleet.json; check audits account + project only
+SERVICE_RUNTIME = "service"
 FLEET_PATH = os.path.join(D.CFG, "fleet.json")
 REG_PATH = os.path.join(D.CFG, "registry.json")
 PROJECT_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")
@@ -219,7 +222,7 @@ def build_fleet(prune=False):
     if prune:
         for h in list(handles):
             cur = handles[h]
-            if cur.get("pane") not in panes and h not in watchers:
+            if cur.get("runtime") != SERVICE_RUNTIME and cur.get("pane") not in panes and h not in watchers:
                 pruned.append(h)
                 del handles[h]
                 retired.add(h)
@@ -748,7 +751,15 @@ def cmd_check(as_json=False):
         sstat = s["status"] if s else ""
         sv = server.get(h) or {}
         verdict = []
-        if not p:
+        service = runtime == SERVICE_RUNTIME
+        if service:
+            cmd, match, wdrift = "(service)", True, False
+            if w:
+                verdict.append("UNEXPECTED WATCHER %s" % w["name"])
+            if server and not sv:
+                verdict.append("NO SERVER ACCOUNT")
+            wstat = "disabled" if not w else wstat
+        elif not p:
             verdict.append("PANE MISSING")
         elif dead:
             verdict.append("PANE DEAD (last cmd %s, exit %s)" % (p["cmd"], p.get("dead_status") or "?"))
@@ -758,7 +769,7 @@ def cmd_check(as_json=False):
             verdict.append("WATCHER PANE %s≠%s" % (wpane, pane))
         if w and wstat != "online":
             verdict.append("watcher %s" % wstat)
-        if ent.get("no_watcher"):
+        if ent.get("no_watcher") and not service:
             wstat = "hooks-only"
         if runtime == "claude" and p and match and not s:
             verdict.append("no Claude session record")

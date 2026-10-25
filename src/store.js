@@ -371,7 +371,7 @@ const stmts = {
     WHERE id = ? AND kind = 'review'
   `),
   cancelTask: db.prepare(`
-    UPDATE tasks SET status = 'cancelled', updated_at = datetime('now')
+    UPDATE tasks SET status = 'cancelled', result = ?, updated_at = datetime('now')
     WHERE id = ?
   `),
   addComment: db.prepare(`
@@ -774,8 +774,8 @@ export function completeTask(id, result = "") {
   return getTask(id);
 }
 
-export function cancelTask(id) {
-  stmts.cancelTask.run(id);
+export function cancelTask(id, result = "") {
+  stmts.cancelTask.run(result, id);
   return getTask(id);
 }
 

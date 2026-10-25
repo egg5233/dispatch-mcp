@@ -577,9 +577,10 @@ function createMcpServer(identity) {
     "Cancel a task that is no longer needed. Response includes worktree cleanup commands if you had one set up.",
     {
       id: z.string().describe("Task ID"),
+      reason: z.string().optional().describe("Why it was cancelled (recorded on the task and in its mirror)"),
     },
-    async ({ id }) => {
-      const task = cancelTask(id);
+    async ({ id, reason }) => {
+      const task = cancelTask(id, reason || "");
       emitTaskEvent("task_cancelled", task, identity);
       mirrorTask(id);
       return {

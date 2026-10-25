@@ -13,6 +13,11 @@ import {
   deleteAllTasks,
   pruneTasks,
   listTasks,
+  getTask,
+  cancelTask,
+  addComment,
+  taskHealth,
+  threadFor,
   listProjects,
   getProject,
   upsertProject,
@@ -28,6 +33,7 @@ import {
   fetchRepo,
   listRepos,
 } from "./git.js";
+import { writeTaskMirror, tasksDirForProject } from "./mirror.js";
 import { hashPassword } from "./auth.js";
 import { stdin, stdout } from "process";
 import readline from "readline";
@@ -80,6 +86,11 @@ Projects (multi-project namespace — a coordinator, its agents, a coordination/
                                                       (--force clears their project first)
 
 Tasks:
+  node src/admin.js cancel-task <id> --reason "<why>"
+                                             Cancel a task (status=cancelled, not deleted) and refresh its
+                                             coordination/ mirror. Use when the assignee can't act on their
+                                             own (declined/offline) and the task needs to be unstuck via the
+                                             server's own path instead of a hand edit to the mirror file.
   node src/admin.js delete-task <id>         Delete one task by id (and its comments)
   node src/admin.js clear-tasks              Delete ALL tasks (asks to confirm; use --yes to skip)
   node src/admin.js prune-tasks <duration>   Delete closed/cancelled tasks older than <duration>.
@@ -409,6 +420,28 @@ switch (cmd) {
       console.error(`Error: ${e.message}`);
       process.exit(1);
     }
+    break;
+  }
+
+  case "cancel-task": {
+    if (!arg) usage();
+    const reason = flag("--reason");
+    const before = getTask(arg);
+    if (!before) {
+      console.error(`Task not found: ${arg}`);
+      process.exit(1);
+    }
+    if (before.status === "cancelled" || before.status === "closed") {
+      console.error(`Task ${arg} is already ${before.status}.`);
+      process.exit(1);
+    }
+    if (reason) addComment(arg, "admin", reason);
+    const task = cancelTask(arg, reason || "");
+    const mirrorPath = writeTaskMirror(task, taskHealth(task), task.thread_id ? threadFor(task.thread_id) : null, tasksDirForProject(getProject(task.project)));
+    console.log(`Cancelled task ${task.id}: ${task.title}`);
+    console.log(`  was: to=${task.to_user || "(broadcast)"} status=${before.status} -> status=${task.status}`);
+    if (reason) console.log(`  reason: ${reason}`);
+    console.log(`  mirror: ${mirrorPath || "(not written)"}`);
     break;
   }
 

@@ -165,6 +165,9 @@ def main(argv):
         if extra:
             line += "  " + "; ".join(extra)
         print(line)
+        if d.get("task_error"):
+            sys.stderr.write("dispatch-send: WARNING: message %s WAS DELIVERED, but no task row was created (%s). "
+                             "Do NOT resend it.\n" % (d.get("id"), d["task_error"]))
         # Idle-wake hint: if the recipient is a Claude session that is idle,
         # SendMessage is the native way to start its next turn now.
         wake_hint(d.get("resolved_to") or to, d.get("id"))

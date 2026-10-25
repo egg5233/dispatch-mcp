@@ -313,8 +313,10 @@ const stmts = {
       ack_required, documents, thread_id, project
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `),
+  // length first: ids are text, so plain id DESC sorts T-…-99 above T-…-100 and the
+  // day's sequence would re-issue -100 forever (UNIQUE tasks.id, 2026-10-26)
   lastTaskIdForDay: db.prepare(`
-    SELECT id FROM tasks WHERE id LIKE ? ORDER BY id DESC LIMIT 1
+    SELECT id FROM tasks WHERE id LIKE ? ORDER BY length(id) DESC, id DESC LIMIT 1
   `),
   ackTask: db.prepare(`
     UPDATE tasks

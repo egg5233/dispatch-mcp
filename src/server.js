@@ -1036,7 +1036,15 @@ function handleSend(identity, payload) {
   // type=task → a task row, linked both ways.
   if (type === "task") {
     const taskProject = explicitProject || projectOf(identity) || (to ? projectOf(to) : null) || null;
-    const task = createTaskFromMessage(message, title, taskProject);
+    // The message is already stored and will be delivered. A failed task row must
+    // not turn into a bare 500: the sender would resend and duplicate the message.
+    let task = null;
+    try {
+      task = createTaskFromMessage(message, title, taskProject);
+    } catch (e) {
+      console.error(`[send] message ${message.id} delivered but createTask failed: ${e.message}`);
+      effects.task_error = String(e.message || e);
+    }
     if (task) {
       db.prepare(`UPDATE messages SET task_id = ? WHERE id = ?`).run(task.id, message.id);
       message.task_id = task.id;

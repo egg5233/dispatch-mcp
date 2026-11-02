@@ -92,6 +92,9 @@ db.exec(`
   );
   CREATE INDEX IF NOT EXISTS idx_messages_inbox
     ON messages (to_user, delivered_at);
+  -- threadFor walks re / task_id; without these each step scanned the whole table (2026-11-02)
+  CREATE INDEX IF NOT EXISTS idx_messages_re ON messages (re);
+  CREATE INDEX IF NOT EXISTS idx_messages_task ON messages (task_id);
 
   -- Per-recipient read set (dispatch v2 P1). The users.last_message_seen_at
   -- cursor alone forced /msg/recv to drain the WHOLE backlog in one go
@@ -1066,14 +1069,20 @@ export function threadFor(messageId) {
     if (!parent) break;
     root = parent;
   }
+  // Each task is expanded once and the queue is walked by index, not shift(): the old loop
+  // re-queued the whole task for every member (N² rows, 4–30 s and ~1 GB on an 800-message
+  // task, blocking the event loop; 2026-11-02). Same visit order, same result.
   const queue = [root];
-  while (queue.length) {
-    const m = queue.shift();
+  const expanded = new Set();
+  for (let i = 0; i < queue.length && seen.size <= 500; i++) {
+    const m = queue[i];
     if (seen.has(m.id)) continue;
     seen.set(m.id, m);
-    for (const c of stmts.childrenOf.all(m.id)) queue.push(c);
-    if (m.task_id) for (const t of stmts.byTask.all(m.task_id)) queue.push(t);
-    if (seen.size > 500) break;
+    for (const c of stmts.childrenOf.all(m.id)) if (!seen.has(c.id)) queue.push(c);
+    if (m.task_id && !expanded.has(m.task_id)) {
+      expanded.add(m.task_id);
+      for (const t of stmts.byTask.all(m.task_id)) if (!seen.has(t.id)) queue.push(t);
+    }
   }
   const rows = [...seen.values()].sort((a, b) => (a.created_at < b.created_at ? -1 : a.created_at > b.created_at ? 1 : 0));
   return { root_id: root.id, task_id: root.task_id || rows.find((r) => r.task_id)?.task_id || null, messages: parseAttachments(rows) };

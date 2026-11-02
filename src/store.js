@@ -117,6 +117,7 @@ db.exec(`
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
   CREATE INDEX IF NOT EXISTS idx_deliveries_msg ON deliveries (message_id);
+  CREATE INDEX IF NOT EXISTS idx_deliveries_msg_handle ON deliveries (message_id, handle);
 
   CREATE TABLE IF NOT EXISTS message_reads (
     handle TEXT NOT NULL,
@@ -565,14 +566,23 @@ const stmts = {
   insertDelivery: db.prepare(`
     INSERT INTO deliveries (message_id, handle, method, detail) VALUES (?, ?, ?, ?)
   `),
+  // Latest row per (method, detail) for one message: the dashboard only shows which paths
+  // reached it, and one message had collected 60k identical 'blocked' rows (2026-11-02).
   deliveriesFor: db.prepare(`
     SELECT message_id, handle, method, detail, created_at FROM deliveries
-     WHERE message_id = ? ORDER BY created_at ASC, id ASC
+     WHERE id IN (SELECT MAX(id) FROM deliveries WHERE message_id = ? GROUP BY handle, method, detail)
+     ORDER BY created_at ASC, id ASC LIMIT 200
   `),
+  // The newest 5000 since a time, oldest first.
   recentDeliveries: db.prepare(`
-    SELECT message_id, handle, method, detail, created_at FROM deliveries
-     WHERE created_at >= ? ORDER BY created_at ASC, id ASC
+    SELECT * FROM (SELECT message_id, handle, method, detail, created_at, id FROM deliveries
+                    WHERE created_at >= ? ORDER BY id DESC LIMIT 5000)
+     ORDER BY created_at ASC, id ASC
   `),
+  lastDeliveryFor: db.prepare(`
+    SELECT id, method, detail FROM deliveries WHERE message_id IS ? AND handle = ? ORDER BY id DESC LIMIT 1
+  `),
+  touchDelivery: db.prepare(`UPDATE deliveries SET created_at = datetime('now') WHERE id = ?`),
   childrenOf: db.prepare(`SELECT * FROM messages WHERE re = ? ORDER BY created_at ASC, rowid ASC`),
   byTask: db.prepare(`SELECT * FROM messages WHERE task_id = ? ORDER BY created_at ASC, rowid ASC`),
   reportsForTask: db.prepare(`
@@ -1013,7 +1023,15 @@ export function pruneMessages(cutoff) {
 export function recordDelivery(handle, method, messageIds = [], detail = null) {
   const ids = Array.isArray(messageIds) && messageIds.length ? messageIds : [null];
   const tx = db.transaction(() => {
-    for (const id of ids) stmts.insertDelivery.run(id, handle, method, detail);
+    for (const id of ids) {
+      // A watcher re-posts the same 'blocked' reason every 30 s for every message it still
+      // holds; refresh the identical last row instead of adding one (~42k rows/day, 2026-11-02).
+      if (method === "blocked") {
+        const last = stmts.lastDeliveryFor.get(id, handle);
+        if (last && last.method === "blocked" && last.detail === detail) { stmts.touchDelivery.run(last.id); continue; }
+      }
+      stmts.insertDelivery.run(id, handle, method, detail);
+    }
   });
   tx();
   return ids.length;
